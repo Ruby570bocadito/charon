@@ -95,7 +95,7 @@ impl PrincipalName {
         self.name_string.join("/")
     }
 
-    pub(crate) fn build(&self) -> Asn1Result<Vec<u8>> {
+    pub fn build(&self) -> Asn1Result<Vec<u8>> {
         let strings: Vec<Vec<u8>> = self
             .name_string
             .iter()

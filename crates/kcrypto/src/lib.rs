@@ -42,6 +42,8 @@ pub mod usage {
     /// Checksum del authenticator en el TGS-REQ, con la clave de sesión
     /// del TGT (MIT 1.21 y Windows lo exigen).
     pub const TGS_REQ_AUTH_CKSUM: u32 = 6;
+    /// Checksum de datos de aplicación (el del PA-FOR-USER de MS-SFU).
+    pub const APP_DATA_CKSUM: u32 = 17;
     /// TGS-REP enc-part, con la clave de sesión del TGT.
     pub const TGS_REP_ENCPART_SESSKEY: u32 = 8;
     /// TGS-REP enc-part, con el subkey del authenticator (raro; errata RC4 8/9).

@@ -421,3 +421,110 @@ pub fn parse_tgs_reply(reply: &[u8], tgt_session_key: &EncryptionKey) -> Result<
         raw_reply: reply.to_vec(),
     })
 }
+
+// ---------- S4U2Self (MS-SFU §2.2) ----------
+
+/// Construye el PA-FOR-USER de MS-SFU §2.2.2.
+///
+/// El checksum usa la construcción HMAC-MD5-ARCFOUR ("signaturekey")
+/// con usage 17 **independientemente del etype de la clave de sesión**
+/// ("Per spec, use hmac-md5 checksum regardless of key type", MIT
+/// s4u_creds.c), sobre `LE32(name-type) || componentes || realm ||
+/// "Kerberos"`.
+pub fn build_pa_for_user(
+    session_key: &charon_kcrypto::KerberosKey,
+    target_user: &str,
+    realm: &str,
+) -> Result<PaData> {
+    let user = PrincipalName::user(target_user);
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(&user.name_type.to_le_bytes());
+    for comp in &user.name_string {
+        data.extend_from_slice(comp.as_bytes());
+    }
+    data.extend_from_slice(realm.as_bytes());
+    data.extend_from_slice(b"Kerberos");
+    let cksum = charon_kcrypto::rc4hmac::checksum(session_key.as_bytes(), charon_kcrypto::usage::APP_DATA_CKSUM, &data)?;
+
+    let pa_for_user = charon_asn1::encode_sequence(&[
+        charon_asn1::encode_context_wrapped(0, &user.build()?)?,
+        charon_asn1::encode_context_wrapped(1, &charon_asn1::encode_string(realm))?,
+        charon_asn1::encode_context_wrapped(
+            2,
+            &Checksum { cksumtype: -138, checksum: cksum }.build()?,
+        )?,
+        charon_asn1::encode_context_wrapped(3, &charon_asn1::encode_string("Kerberos"))?,
+    ])?;
+    Ok(PaData { pa_type: pa_type::PA_FOR_USER, pa_value: pa_for_user })
+}
+
+/// S4U2Self: obtiene un ticket "para" `target_user` presentando el TGT de
+/// `service`. El ticket devuelto va cifrado con la clave larga del
+/// servicio: con ella, `pac::extract_pac` muestra el PAC del usuario
+/// suplantado (la prueba de que el KDC lo emitió en su nombre).
+pub fn s4u2self(
+    conn: &KdcConnection,
+    tgt: &Tgt,
+    service_as: &str,
+    target_user: &str,
+    realm: &str,
+) -> Result<ServiceTicket> {
+    let session_key = charon_kcrypto::KerberosKey::from_raw(tgt.session_key.keytype, &tgt.session_key.keyvalue)?;
+    let body = KdcReqBody {
+        kdc_options: kdc_options::FORWARDABLE | kdc_options::CANONICALIZE,
+        cname: None,
+        realm: realm.to_string(),
+        // S4U2Self: el sname es el PROPIO servicio que pide; el usuario
+        // suplantado viaja en el PA-FOR-USER (MS-SFU §2.2.2).
+        sname: Some(PrincipalName::user(service_as)),
+        from: None,
+        till: KrbTime::now().plus_secs(600),
+        rtime: None,
+        nonce: random_u32().unwrap_or(1),
+        etypes: vec![charon_kcrypto::etype::AES256_CTS_HMAC_SHA1_96, charon_kcrypto::etype::RC4_HMAC],
+        addresses: None,
+        enc_authorization_data: None,
+        additional_tickets: None,
+    };
+    let body_tlv = body.build()?;
+    let cksum_data = charon_kcrypto::checksum(&session_key, charon_kcrypto::usage::TGS_REQ_AUTH_CKSUM, &body_tlv)?;
+    let cksum_type = match tgt.session_key.keytype {
+        charon_kcrypto::etype::RC4_HMAC => -138,
+        _ => 16,
+    };
+    let now = KrbTime::now();
+    let authenticator = Authenticator {
+        crealm: tgt.crealm.clone(),
+        cname: PrincipalName::user(&tgt.cname),
+        cksum: Some(Checksum { cksumtype: cksum_type, checksum: cksum_data }),
+        cusec: 0,
+        ctime: now,
+        subkey: None,
+        seq_number: None,
+    };
+    let auth_plain = authenticator.build()?;
+    let auth_edata = charon_kcrypto::encrypt(&session_key, charon_kcrypto::usage::TGS_REQ_AUTH, &auth_plain)?;
+    let pa_for_user = build_pa_for_user(&session_key, target_user, realm)?;
+    let req = KdcReq {
+        msg_type: MSG_TGS_REQ,
+        padata: vec![
+            PaData {
+                pa_type: pa_type::PA_TGS_REQ,
+                pa_value: ApReq {
+                    ap_options: 0,
+                    ticket: tgt.ticket.clone(),
+                    authenticator: EncryptedData {
+                        etype: tgt.session_key.keytype,
+                        kvno: None,
+                        cipher: auth_edata,
+                    },
+                }
+                .build()?,
+            },
+            pa_for_user,
+        ],
+        body,
+    };
+    let (reply, _transport) = conn.exchange(&req.build()?)?;
+    parse_tgs_reply(&reply, &tgt.session_key)
+}
