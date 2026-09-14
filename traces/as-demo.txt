@@ -1,0 +1,38 @@
+[1mAS:[0m TGT [36mjdoe@LAB.LOCAL[39m → [33mkrbtgt/LAB.LOCAL[39m, sesión etype 18, caduca 20260915214324Z
+
+AS-REP
+   ⟶ RFC 4120 §5.4.2 — respuesta del KDC con el ticket pedido
+  crealm = LAB.LOCAL
+     ⟶ RFC 4120 §5.4.2
+  cname = jdoe
+     ⟶ RFC 4120 §5.4.2
+  ticket
+     ⟶ RFC 4120 §5.3 — el ticket (solo el KDC y el servicio lo pueden leer)
+    realm = LAB.LOCAL
+       ⟶ dominio del servicio
+    sname = krbtgt/LAB.LOCAL
+       ⟶ identidad del servicio
+    enc-part.etype = 23
+       · RC4-HMAC (downgrade si la cuenta tiene AES: evento 4769 con 0x17)
+       ⟶ RFC 3962/4757 — etype de la clave del SERVICIO
+    enc-part.cipher = 335 bytes
+       ⟶ dentro va la clave de sesión y el PAC (firmado por krbtgt)
+  enc-part.etype = 18
+     ⟶ etype con el que se cifra ESTE enc-part
+  enc-part (descifrado)
+     ⟶ RFC 4120 §5.4.2 — EncKDCRepPart
+    key (clave de sesión) = etype 18 / 32 bytes
+       ⟶ usage 3 (clave del cliente)
+    nonce = 253149679
+       ⟶ eco del nonce del AS-REQ (antirreplay)
+    flags = 0x00610000
+       ⟶ bit 9=initial (es un TGT nuevo), 10=pre-authent, 1=forwardable, 13=ok-as-delegate
+    authtime = 20260914214324Z
+       ⟶ cuándo se autenticó el usuario
+    endtime = 20260915214324Z
+       ⟶ caducidad del ticket
+    srealm = LAB.LOCAL
+       ⟶ dominio del servicio
+    sname = krbtgt/LAB.LOCAL
+       ⟶ servicio
+

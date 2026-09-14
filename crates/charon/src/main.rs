@@ -349,7 +349,14 @@ fn run(cli: Cli) -> Result<(), String> {
                 return Err("indica --nt-hash o --aes-key".into());
             };
             let _ = salt_used;
-            let tgt = charon_client::request_tgt(&c, &user, &realm, &key, &[key.etype()], 0)
+            // Con clave RC4 pedimos también 18: MIT 1.21 exige un etype de
+            // sesión no deprecado aunque el preauth verifique con RC4.
+            let etypes: Vec<i32> = if key.etype() == etype_mod::RC4_HMAC {
+                vec![etype_mod::RC4_HMAC, etype_mod::AES256_CTS_HMAC_SHA1_96]
+            } else {
+                vec![key.etype()]
+            };
+            let tgt = charon_client::request_tgt(&c, &user, &realm, &key, &etypes, 0)
                 .map_err(|e| format!("pass-the-key rechazado por el KDC: {e}"))?;
             println!(
                 "{} TGT obtenido para {} usando la clave directamente ({}).",

@@ -1,0 +1,154 @@
+{
+  "generated_at": "20260914214442Z",
+  "kdc_profile": "mit-krb5-1.21.3",
+  "host": "127.0.0.1",
+  "port": 1088,
+  "realm": "LAB.LOCAL",
+  "rows": [
+    {
+      "id": "AS-001",
+      "name": "AS-REQ sin preauth a usuario inexistente",
+      "description": "cname=<inexistente>, sin PA-DATA",
+      "expected": "KDC_ERR_PRINCIPAL_UNKNOWN (6)",
+      "observed_code": "6",
+      "observed_name": "KDC_ERR_PRINCIPAL_UNKNOWN",
+      "e_text": "CLIENT_NOT_FOUND",
+      "transport": "UDP"
+    },
+    {
+      "id": "AS-002",
+      "name": "AS-REQ sin preauth a usuario existente",
+      "description": "cname=<existente>, sin PA-DATA",
+      "expected": "KDC_ERR_PREAUTH_REQUIRED (25) + PA-ETYPE-INFO2 con salt",
+      "observed_code": "25",
+      "observed_name": "KDC_ERR_PREAUTH_REQUIRED",
+      "e_text": "NEEDED_PREAUTH",
+      "notes": "salts filtrados: [etype 18: LAB.LOCALjdoe]",
+      "transport": "UDP"
+    },
+    {
+      "id": "AS-003",
+      "name": "AS-REQ con contraseña incorrecta",
+      "description": "PA-ENC-TIMESTAMP válido en forma, contenido erróneo",
+      "expected": "KDC_ERR_PREAUTH_FAILED (24)",
+      "observed_code": "24",
+      "observed_name": "KDC_ERR_PREAUTH_FAILED",
+      "e_text": "PREAUTH_FAILED",
+      "transport": "UDP"
+    },
+    {
+      "id": "AS-004",
+      "name": "AS-REQ pidiendo etype 9999",
+      "description": "lista de etypes con un valor inexistente",
+      "expected": "KDC_ERR_ETYPE_NOTSUPP (14) o 25",
+      "observed_code": "14",
+      "observed_name": "KDC_ERR_ETYPE_NOTSUPP",
+      "e_text": "BAD_ENCRYPTION_TYPE",
+      "transport": "UDP"
+    },
+    {
+      "id": "AS-005",
+      "name": "AS-REQ a cuenta DONT_REQUIRE_PREAUTH",
+      "description": "sin preauth sobre cuenta con la opción desactivada",
+      "expected": "AS-REP directo (enc-part cifrado con la clave del usuario: AS-REP roast)",
+      "observed_code": "AS-REP/TGS-REP",
+      "transport": "UDP"
+    },
+    {
+      "id": "AS-006",
+      "name": "AS-REQ con timestamp a +10 minutos",
+      "description": "preauth con reloj adelantado más allá del skew típico (5 min)",
+      "expected": "rechazo del preauth (24) o aceptación según política",
+      "observed_code": "37",
+      "observed_name": "KRB_AP_ERR_SKEW",
+      "e_text": "PREAUTH_FAILED",
+      "transport": "UDP"
+    },
+    {
+      "id": "AS-007",
+      "name": "AS-REQ con cname en mayúsculas",
+      "description": "cname=JDOE vs jdoe",
+      "expected": "KerberosString es case-sensitive por RFC; ¿el KDC la pliega?",
+      "observed_code": "6",
+      "observed_name": "KDC_ERR_PRINCIPAL_UNKNOWN",
+      "e_text": "CLIENT_NOT_FOUND",
+      "transport": "UDP"
+    },
+    {
+      "id": "AS-008",
+      "name": "AS-REQ a realm inexistente",
+      "description": "realm=NOEXISTE.INVALID",
+      "expected": "KDC_ERR_PRINCIPAL_UNKNOWN (6) o referral (13)",
+      "observed_code": "6",
+      "observed_name": "KDC_ERR_PRINCIPAL_UNKNOWN",
+      "e_text": "CLIENT_NOT_FOUND",
+      "transport": "UDP"
+    },
+    {
+      "id": "AS-009",
+      "name": "AS-REQ con PA-DATA tipo 4242",
+      "description": "padata-type sin significado",
+      "expected": "ignorado (25) o KDC_ERR_PADATA_TYPE_NOSUPP (16): huella de implementación",
+      "observed_code": "25",
+      "observed_name": "KDC_ERR_PREAUTH_REQUIRED",
+      "e_text": "NEEDED_PREAUTH",
+      "transport": "UDP"
+    },
+    {
+      "id": "TGS-001",
+      "name": "TGS-REQ a SPN inexistente",
+      "description": "sname=<spn sin registrar>",
+      "expected": "KDC_ERR_S_PRINCIPAL_UNKNOWN (7)",
+      "observed_code": "7",
+      "observed_name": "KDC rechazó el TGS-REQ: KDC_ERR_S_PRINCIPAL_UNKNOWN (el SPN NO existe (kerberoas",
+      "transport": "UDP"
+    },
+    {
+      "id": "TGS-002",
+      "name": "TGS-REQ con SPN de una sola componente",
+      "description": "sname=<sin barra>, nt-srv-inst",
+      "expected": "7 o 13 según implementación",
+      "observed_code": "7",
+      "observed_name": "KDC rechazó el TGS-REQ: KDC_ERR_S_PRINCIPAL_UNKNOWN (el SPN NO existe (kerberoas",
+      "transport": "UDP"
+    },
+    {
+      "id": "TGS-003",
+      "name": "TGS-REQ pidiendo etype 9999",
+      "description": "lista de etypes imposible",
+      "expected": "KDC_ERR_ETYPE_NOTSUPP (14)",
+      "observed_code": "14/15",
+      "observed_name": "KDC rechazó el TGS-REQ: KDC_ERR_ETYPE_NOTSUPP (etype no soportado: huella de con",
+      "transport": "UDP"
+    },
+    {
+      "id": "TGS-004",
+      "name": "TGS-REQ con etypes [18,17,23] a cuenta AES",
+      "description": "AES-first: la herramienta pide primero el etype fuerte",
+      "expected": "ticket en etype 18 (sin evento 4769 con 0x17)",
+      "observed_code": "OK",
+      "notes": "ticket en etype 18",
+      "transport": "UDP"
+    },
+    {
+      "id": "TGS-005",
+      "name": "TGS-REQ con etypes [18,17,23] a cuenta RC4-only",
+      "description": "la cuenta no tiene AES",
+      "expected": "ticket en etype 23 (única opción de la cuenta)",
+      "observed_code": "OK",
+      "notes": "ticket en etype 23",
+      "transport": "UDP"
+    },
+    {
+      "id": "TGS-006",
+      "name": "replay exacto del TGS-REQ",
+      "description": "se reenvía byte a byte la misma petición (mismo authenticator)",
+      "expected": "KRB_AP_ERR_REPEAT (34) si hay caché de replays",
+      "observed_code": "50",
+      "observed_name": "DESCONOCIDO",
+      "e_text": "PROCESS_TGS",
+      "notes": "primera petición idéntica tuvo éxito",
+      "transport": "UDP"
+    }
+  ]
+}

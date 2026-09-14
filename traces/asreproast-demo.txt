@@ -1,0 +1,5 @@
+
+[1masreproast:[0m [36mnopreauth[39m → cuenta sin preauth, ticket en [33mAES256-CTS-HMAC-SHA1-96[39m
+[32m$krb5pa$18$nopreauth$LAB.LOCAL$d04307c1bf58e99315c553b7e41455965e439598bcafb9408fa363f4d7b2c35dcc5ae887a67093d1cf5b6c771216ab95397123d259bb47d0f70888ee2f422e9ef0139534bd0d6b32e831a52a53262bda922b41b4d87bb85c7dc4193d68edc62f4e0797b06b2e572b37fdf559df2886b3d947fe170a696454ce214fb97b301357f762b9df631e969901dfd080417ac2a2149a23accea4806ae6851c8a7fa35326191baa836a7968f1307f9c73890a83cf3772683ac419dc3aeb39b6d52a689a682c348886a5ddfefdb9d6c59a0bb21116a4[39m
+[2m·[0m jdoe: la cuenta requiere preauth o no existe
+[2m·[0m ghost-inexistente: la cuenta requiere preauth o no existe

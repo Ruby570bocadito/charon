@@ -1,1 +1,9 @@
-[1m[31merror:[39m[0m E/S con el KDC: failed to fill whole buffer
+[1m[32m✓[39m[0m [36mjdoe[39m existe (requiere preauth)
+    salt (etype 18): [33mLAB.LOCALjdoe[39m
+[1m[32m✓[39m[0m [36maesuser[39m existe (requiere preauth)
+    salt (etype 18): [33mLAB.LOCALaesuser[39m
+[1m[32m✓[39m[0m [36mlegacy[39m existe (requiere preauth)
+[1m[33m![39m[0m [36mnopreauth[39m existe y NO requiere preauth → AS-REP roasteable
+[1m[31m✗[39m[0m [2mghost-inexistente[0m no existe
+
+[1mresumen:[0m [36m4[39m de 5 usuarios existen según [1m127.0.0.1[0m

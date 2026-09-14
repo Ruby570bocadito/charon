@@ -1,0 +1,2 @@
+[1mpass-the-key:[0m TGT obtenido para [36mjdoe[39m usando la clave directamente (RC4-HMAC).
+  sesión: etype 18, caduca 20260915214411Z

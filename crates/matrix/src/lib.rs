@@ -146,10 +146,10 @@ pub fn run_battery(ctx: &ProbeCtx, profile: &str) -> MatrixDataset {
         }
     }
 
-    // 3. Preauth con contraseña incorrecta.
+    // 3. Preauth con contraseña incorrecta (clave AES del salt correcto).
     {
-        let bad = KerberosKey::from_password("Contrasena-Equivocada-XYZ", &format!("{}{}", ctx.realm, ctx.user), 23).unwrap();
-        let req = charon_client::build_as_req(&ctx.user, &ctx.realm, Some(&bad), &[23], true, 0);
+        let bad = KerberosKey::from_password("Contrasena-Equivocada-XYZ", &format!("{}{}", ctx.realm, ctx.user), 18).unwrap();
+        let req = charon_client::build_as_req(&ctx.user, &ctx.realm, Some(&bad), &[18], true, 0);
         if let Ok(r) = req {
             if let Ok((reply, tr)) = ctx.conn.exchange(&r.build().unwrap_or_default()) {
                 rows.push(code_row("AS-003", "AS-REQ con contraseña incorrecta",
