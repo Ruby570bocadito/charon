@@ -36,6 +36,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "charon-client"
+version = "0.1.0"
+dependencies = [
+ "charon-asn1",
+ "charon-kcrypto",
+ "charon-krb5",
+ "getrandom",
+ "hex",
+ "thiserror",
+]
+
+[[package]]
 name = "charon-kcrypto"
 version = "0.1.0"
 dependencies = [

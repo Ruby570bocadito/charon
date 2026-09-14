@@ -12,7 +12,7 @@ pub mod pac;
 #[cfg(test)]
 mod tests;
 
-pub use error_codes::KdcErrorCode;
+pub use error_codes::*;
 pub use msgs::*;
 pub use pac::Pac;
 

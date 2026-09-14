@@ -4,6 +4,7 @@ members = [
     "crates/asn1",
     "crates/kcrypto",
     "crates/krb5",
+    "crates/client",
 ]
 
 [workspace.package]
@@ -16,6 +17,7 @@ license = "MIT"
 charon-asn1 = { path = "crates/asn1" }
 charon-kcrypto = { path = "crates/kcrypto" }
 charon-krb5 = { path = "crates/krb5" }
+charon-client = { path = "crates/client" }
 
 # Primitivos criptográficos auditados (RustCrypto) — ADR-003 prohíbe
 # reimplementar primitivos; Charon implementa solo las construcciones

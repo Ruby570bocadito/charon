@@ -1,0 +1,16 @@
+[package]
+name = "charon-client"
+description = "Cliente KDC: transporte UDP/TCP:88 (RFC 4120 §7.2), intercambios AS/TGS y sondas de enumeración"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+charon-asn1.workspace = true
+charon-kcrypto.workspace = true
+charon-krb5.workspace = true
+thiserror.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+hex = "0.4"

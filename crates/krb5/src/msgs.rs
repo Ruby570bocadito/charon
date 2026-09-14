@@ -347,6 +347,14 @@ impl EncKdcRepPart {
         Ok(encode_sequence(&children)?)
     }
 
+    /// Parse desde bytes crudos descifrados (el contenido del enc-part).
+    pub fn parse_element(bytes: &[u8]) -> Result<EncKdcRepPart> {
+        let mut r = charon_asn1::DerReader::new(bytes);
+        let el = r.next()?.ok_or(charon_asn1::Asn1Error::TrailingBytes(0))?;
+        r.finish()?;
+        EncKdcRepPart::parse(&el)
+    }
+
     pub fn parse(el: &Element<'_>) -> Result<EncKdcRepPart> {
         let mut f = el.parse_seq()?;
         let key = EncryptionKey::parse(&f.context_child_req(0)?.unwrap_context()?)?;
