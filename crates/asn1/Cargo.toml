@@ -1,0 +1,9 @@
+[package]
+name = "charon-asn1"
+description = "Codec DER (X.690) mínimo y propio para Kerberos — ADR-001"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

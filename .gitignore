@@ -1,0 +1,16 @@
+# Build de Rust
+/target
+**/*.rs.bk
+
+# Estado del laboratorio local (rootfs, BD del KDC, capturas temporales)
+/charon-lab
+/lab-dl
+*.keytab
+*.ccache
+*.cc
+
+# Resultados de la matriz: el dataset publicado va en dataset/ (sí se versiona);
+# los ejecuciones locales ad-hoc van a /tmp.
+matrix-out/
+
+# Nota: traces/ y dataset/ contienen artefactos reales del proyecto y SÍ se versionan.
