@@ -370,19 +370,33 @@ pub fn request_service_ticket(
         additional_tickets: None,
     };
     let body_tlv = body.build()?;
-
-    // 2) Checksum del authenticator: con clave de sesión del TGT, usage 6
-    // (RFC 4120 §7.5.1), cubre el TLV del req-body. Tipos collision-proof
-    // exigidos por el KDC: HMAC-SHA1-96 AES (15/16) o HMAC-MD5-ARCFOUR (-138),
-    // exactamente lo que produce kcrypto::checksum según el etype.
     let session_key = charon_kcrypto::KerberosKey::from_raw(tgt.session_key.keytype, &tgt.session_key.keyvalue)?;
-    let cksum_data = charon_kcrypto::checksum(&session_key, charon_kcrypto::usage::TGS_REQ_AUTH_CKSUM, &body_tlv)?;
+    let req = KdcReq {
+        msg_type: MSG_TGS_REQ,
+        padata: vec![build_pa_tgs_req(tgt, &session_key, &body_tlv)?],
+        body,
+    };
+    let (reply, _transport) = conn.exchange(&req.build()?)?;
+    parse_tgs_reply(&reply, &tgt.session_key)
+}
+
+/// Bloque común de cada TGS-REQ (RFC 4120 §3.3.3): el PA-TGS-REQ con el
+/// AP-REQ del TGT. El authenticator lleva checksum collision-proof sobre
+/// el TLV del req-body (usage 6, RFC 4120 §7.5.1: HMAC-SHA1-96 AES 15/16
+/// o HMAC-MD5-ARCFOUR -138, exactamente lo que produce kcrypto::checksum
+/// según el etype) y viaja cifrado con la clave de sesión del TGT
+/// (usage 7). El KDC lo exige en MIT 1.21 y Windows.
+fn build_pa_tgs_req(
+    tgt: &Tgt,
+    session_key: &charon_kcrypto::KerberosKey,
+    body_tlv: &[u8],
+) -> Result<PaData> {
+    let cksum_data =
+        charon_kcrypto::checksum(session_key, charon_kcrypto::usage::TGS_REQ_AUTH_CKSUM, body_tlv)?;
     let cksum_type = match tgt.session_key.keytype {
         charon_kcrypto::etype::RC4_HMAC => -138, // HMAC-MD5-ARCFOUR
         _ => 16,                                 // HMAC-SHA1-96-AES256 (o 15 con AES128: mismo formato)
     };
-
-    // 3) Authenticator cifrado con la clave de sesión del TGT (usage 7).
     let now = KrbTime::now();
     let authenticator = Authenticator {
         crealm: tgt.crealm.clone(),
@@ -394,26 +408,20 @@ pub fn request_service_ticket(
         seq_number: None,
     };
     let auth_plain = authenticator.build()?;
-    let auth_edata = charon_kcrypto::encrypt(&session_key, charon_kcrypto::usage::TGS_REQ_AUTH, &auth_plain)?;
-    let ap_req = ApReq {
-        ap_options: 0,
-        ticket: tgt.ticket.clone(),
-        authenticator: EncryptedData {
-            etype: tgt.session_key.keytype,
-            kvno: None,
-            cipher: auth_edata,
-        },
-    };
-    let req = KdcReq {
-        msg_type: MSG_TGS_REQ,
-        padata: vec![PaData {
-            pa_type: pa_type::PA_TGS_REQ,
-            pa_value: ap_req.build()?,
-        }],
-        body,
-    };
-    let (reply, _transport) = conn.exchange(&req.build()?)?;
-    parse_tgs_reply(&reply, &tgt.session_key)
+    let auth_edata = charon_kcrypto::encrypt(session_key, charon_kcrypto::usage::TGS_REQ_AUTH, &auth_plain)?;
+    Ok(PaData {
+        pa_type: pa_type::PA_TGS_REQ,
+        pa_value: ApReq {
+            ap_options: 0,
+            ticket: tgt.ticket.clone(),
+            authenticator: EncryptedData {
+                etype: tgt.session_key.keytype,
+                kvno: None,
+                cipher: auth_edata,
+            },
+        }
+        .build()?,
+    })
 }
 
 pub fn parse_tgs_reply(reply: &[u8], tgt_session_key: &EncryptionKey) -> Result<ServiceTicket> {
@@ -438,6 +446,122 @@ pub fn parse_tgs_reply(reply: &[u8], tgt_session_key: &EncryptionKey) -> Result<
         session_key: part.key.clone(),
         flags: part.flags,
         raw_reply: reply.to_vec(),
+    })
+}
+
+// ---------- renovación de TGT (RFC 4120 §3.1.3, §3.3.3) ----------
+
+/// AS-REQ de un TGT RENOVABLE (equivalente a `kinit -r`): el cuerpo
+/// lleva el flag RENEWABLE y el campo `rtime` con la ventana de
+/// renovación pedida. El KDC recorta `rtime` a su max_renewable_life
+/// (en el lab: 7 días) y concede el flag solo si queda vida útil.
+pub fn build_as_req_renewable(
+    user: &str,
+    realm: &str,
+    key: &KerberosKey,
+    etypes: &[i32],
+    renew_till: KrbTime,
+) -> Result<KdcReq> {
+    let padata = vec![build_pa_enc_timestamp(key)?, build_pa_pac_request(true)?];
+    Ok(KdcReq {
+        msg_type: MSG_AS_REQ,
+        padata,
+        body: KdcReqBody {
+            kdc_options: kdc_options::RENEWABLE | kdc_options::FORWARDABLE,
+            cname: Some(PrincipalName::user(user)),
+            realm: realm.to_string(),
+            sname: Some(PrincipalName::krbtgt(realm)),
+            from: None,
+            till: KrbTime::now().plus_secs(86_400),
+            rtime: Some(renew_till),
+            nonce: random_u32().unwrap_or(1),
+            etypes: etypes.to_vec(),
+            addresses: None,
+            enc_authorization_data: None,
+            additional_tickets: None,
+        },
+    })
+}
+
+/// Obtiene un TGT renovable: AS-REQ con RENEWABLE+rtime y preauth normal.
+pub fn request_tgt_renewable(
+    conn: &KdcConnection,
+    user: &str,
+    realm: &str,
+    key: &KerberosKey,
+    etypes: &[i32],
+    renew_till: KrbTime,
+) -> Result<Tgt> {
+    let req = build_as_req_renewable(user, realm, key, etypes, renew_till)?;
+    let (reply, _transport) = conn.exchange(&req.build()?)?;
+    parse_as_reply(&reply, user, key)
+}
+
+/// Renueva un TGT: TGS-REQ con el flag RENEW, el propio TGT como ticket
+/// de cabecera y sname = krbtgt/reino. El KDC valida que el ticket
+/// lleve RENEWABLE y que `now` esté dentro de su ventana, conserva la
+/// authtime original y devuelve un TGT nuevo (clave de sesión fresca)
+/// con el endtime extendido hasta min(now + max_life, renew-till).
+/// Se pide también RENEWABLE: el RFC 4120 §3.1.3 solo concede los
+/// flags de renovación si el cliente los pide en las opciones — así el
+/// TGT renovado sigue renovable dentro de su ventana (lo que hace
+/// `kinit -R`). El enc-part de la respuesta va cifrado con la clave de
+/// sesión del TGT ORIGINAL (usage 8).
+pub fn renew_tgt(conn: &KdcConnection, tgt: &Tgt, till: KrbTime) -> Result<Tgt> {
+    let session_key = charon_kcrypto::KerberosKey::from_raw(tgt.session_key.keytype, &tgt.session_key.keyvalue)?;
+    let body = KdcReqBody {
+        kdc_options: kdc_options::RENEW | kdc_options::RENEWABLE,
+        cname: None,
+        realm: tgt.crealm.clone(),
+        sname: Some(PrincipalName::krbtgt(&tgt.crealm)),
+        from: None,
+        till,
+        rtime: tgt.renew_till,
+        nonce: random_u32().unwrap_or(1),
+        etypes: vec![tgt.session_key.keytype],
+        addresses: None,
+        enc_authorization_data: None,
+        additional_tickets: None,
+    };
+    let body_tlv = body.build()?;
+    let req = KdcReq {
+        msg_type: MSG_TGS_REQ,
+        padata: vec![build_pa_tgs_req(tgt, &session_key, &body_tlv)?],
+        body,
+    };
+    let (reply, _transport) = conn.exchange(&req.build()?)?;
+    parse_tgs_reply_as_tgt(&reply, &tgt.session_key)
+}
+
+/// Como parse_tgs_reply pero devolviendo un `Tgt` completo (con
+/// authtime/endtime/renew_till): la renovación devuelve otro TGT, no
+/// un ticket de servicio.
+pub fn parse_tgs_reply_as_tgt(reply: &[u8], tgt_session_key: &EncryptionKey) -> Result<Tgt> {
+    if let Ok(err) = KrbError::parse(reply) {
+        let d = error_codes::describe(err.error_code);
+        return Err(ClientError::Krb5(Krb5Error::BadReply(format!(
+            "KDC rechazó el TGS-REQ: {} ({}){}",
+            d.name,
+            d.leak,
+            err.e_text.as_deref().map(|t| format!(" — \"{}\"", t)).unwrap_or_default()
+        ))));
+    }
+    let rep = KdcRep::parse(reply)?;
+    let key = charon_kcrypto::KerberosKey::from_raw(tgt_session_key.keytype, &tgt_session_key.keyvalue)?;
+    // El enc-part del TGS-REP va con la clave de sesión del TGT (usage 8).
+    let plain = charon_kcrypto::decrypt(&key, charon_kcrypto::usage::TGS_REP_ENCPART_SESSKEY, &rep.enc_part.cipher)?;
+    let part = EncKdcRepPart::parse_element(&plain)?;
+    Ok(Tgt {
+        crealm: rep.crealm,
+        cname: rep.cname.flat(),
+        ticket: rep.ticket,
+        session_key: part.key,
+        flags: part.flags,
+        authtime: part.authtime,
+        endtime: part.endtime,
+        renew_till: part.renew_till,
+        raw_reply: reply.to_vec(),
+        enc_rep_part_raw: plain,
     })
 }
 
@@ -506,42 +630,10 @@ pub fn s4u2self(
         additional_tickets: None,
     };
     let body_tlv = body.build()?;
-    let cksum_data = charon_kcrypto::checksum(&session_key, charon_kcrypto::usage::TGS_REQ_AUTH_CKSUM, &body_tlv)?;
-    let cksum_type = match tgt.session_key.keytype {
-        charon_kcrypto::etype::RC4_HMAC => -138,
-        _ => 16,
-    };
-    let now = KrbTime::now();
-    let authenticator = Authenticator {
-        crealm: tgt.crealm.clone(),
-        cname: PrincipalName::user(&tgt.cname),
-        cksum: Some(Checksum { cksumtype: cksum_type, checksum: cksum_data }),
-        cusec: 0,
-        ctime: now,
-        subkey: None,
-        seq_number: None,
-    };
-    let auth_plain = authenticator.build()?;
-    let auth_edata = charon_kcrypto::encrypt(&session_key, charon_kcrypto::usage::TGS_REQ_AUTH, &auth_plain)?;
     let pa_for_user = build_pa_for_user(&session_key, target_user, realm)?;
     let req = KdcReq {
         msg_type: MSG_TGS_REQ,
-        padata: vec![
-            PaData {
-                pa_type: pa_type::PA_TGS_REQ,
-                pa_value: ApReq {
-                    ap_options: 0,
-                    ticket: tgt.ticket.clone(),
-                    authenticator: EncryptedData {
-                        etype: tgt.session_key.keytype,
-                        kvno: None,
-                        cipher: auth_edata,
-                    },
-                }
-                .build()?,
-            },
-            pa_for_user,
-        ],
+        padata: vec![build_pa_tgs_req(tgt, &session_key, &body_tlv)?, pa_for_user],
         body,
     };
     let (reply, _transport) = conn.exchange(&req.build()?)?;

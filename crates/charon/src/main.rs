@@ -99,6 +99,13 @@ enum Command {
         /// Usuarios a probar, separados por coma o ruta a fichero (@fichero).
         #[arg(short, long, value_delimiter = ',')]
         users: Vec<String>,
+        /// Fichero (ruta o @ruta) con pares usuario:contraseña, uno por
+        /// línea ('#' comenta; la contraseña puede contener ':'). Si se
+        /// da, cada usuario se prueba con SU contraseña y se ignoran
+        /// --users y --password. Página de seguridad: el fichero queda
+        /// con contraseñas en claro — 900 permisos recomendados.
+        #[arg(long)]
+        pairs: Option<String>,
         /// Contraseña candidata (o --password-stdin; env: CHARON_PASSWORD).
         #[arg(short, long, env = "CHARON_PASSWORD", hide_env_values = true)]
         password: Option<String>,
@@ -173,10 +180,44 @@ enum Command {
         salt: Option<String>,
         #[arg(long, value_enum, default_value = "aes256")]
         etype: ETypeArg,
+        /// Pide un TGT RENOVABLE (flag RENEWABLE + rtime de 7 días, que
+        /// el KDC recorta a su max_renewable_life): lo que `kinit -r`.
+        #[arg(long)]
+        renewable: bool,
         #[arg(long, default_value = "127.0.0.1")]
         dc: String,
         #[arg(long, default_value_t = 88)]
         port: u16,
+    },
+    /// Renovación de TGT (RFC 4120 §3.3.3): pide un TGT renovable y lo
+    /// renueva por el cable (TGS-REQ con flag RENEW y el TGT como
+    /// ticket de cabecera). La renovación conserva la authtime y
+    /// extiende el endtime dentro del renew-till concedido.
+    Renew {
+        #[arg(short, long)]
+        user: String,
+        /// Contraseña (o --password-stdin; env: CHARON_PASSWORD).
+        #[arg(short, long, env = "CHARON_PASSWORD", hide_env_values = true)]
+        password: Option<String>,
+        /// Lee la contraseña por stdin: no aparece en `ps` ni en el history.
+        #[arg(long)]
+        password_stdin: bool,
+        #[arg(short, long)]
+        realm: String,
+        /// Salt AES (por defecto lo aprende del error 25).
+        #[arg(long)]
+        salt: Option<String>,
+        /// Ventana de renovación pedida, en horas (el KDC recorta a su
+        /// max_renewable_life; el lab: 7 días = 168 h).
+        #[arg(long, default_value_t = 168)]
+        renew_hours: u64,
+        #[arg(long, default_value = "127.0.0.1")]
+        dc: String,
+        #[arg(long, default_value_t = 88)]
+        port: u16,
+        /// Muestra el trace del TGS-REP de la renovación.
+        #[arg(long)]
+        trace: bool,
     },
     /// Decodifica cualquier mensaje Kerberos capturado y lo explica campo a campo.
     Decode {
@@ -408,24 +449,39 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
 
-        Command::Spray { users, password, password_stdin, realm, dc, port, delay_ms, json, output } => {
-            let list = resolve_users(&users)?;
-            if list.is_empty() {
-                return fail("--users vacío: pasa usuarios separados por coma o @fichero".into());
+        Command::Spray { users, pairs, password, password_stdin, realm, dc, port, delay_ms, json, output } => {
+            // En modo pares cada usuario lleva SU contraseña; el modo
+            // clásico (una contraseña contra la lista) queda intacto.
+            let targets: Vec<(String, String)> = if let Some(path) = &pairs {
+                if !users.is_empty() || password.is_some() || password_stdin {
+                    return fail(
+                        "--pairs no es compatible con --users/--password/--password-stdin: en modo pares cada usuario lleva su propia contraseña".into(),
+                    );
+                }
+                resolve_pairs(path)?
+            } else {
+                let list = resolve_users(&users)?;
+                if list.is_empty() {
+                    return fail("--users vacío: pasa usuarios separados por coma o @fichero".into());
+                }
+                let password = resolve_password(password, password_stdin)?;
+                list.into_iter().map(|u| (u, password.clone())).collect()
+            };
+            if targets.is_empty() {
+                return fail("no hay objetivos de spray".into());
             }
-            let password = resolve_password(password, password_stdin)?;
             let c = conn(&dc, port);
             let etypes = [etype_mod::AES256_CTS_HMAC_SHA1_96, etype_mod::AES128_CTS_HMAC_SHA1_96];
             let mut hits = Vec::new();
             let mut rows = Vec::new();
-            for (i, u) in list.iter().enumerate() {
+            for (i, (u, pw)) in targets.iter().enumerate() {
                 if i > 0 && delay_ms > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 }
-                match charon_attacks::spray_password(&c, u, &realm, &password, &etypes) {
+                match charon_attacks::spray_password(&c, u, &realm, pw, &etypes) {
                     Ok(att) => {
                         if att.result.valid() {
-                            hits.push(format!("{u}\t{password}"));
+                            hits.push(format!("{u}\t{pw}"));
                         }
                         if !json {
                             print_spray(&att);
@@ -450,7 +506,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     "\n{} {} credenciales válidas de {} usuarios probados contra {}",
                     "resumen:".bold(),
                     hits.len().to_string().cyan(),
-                    list.len(),
+                    targets.len(),
                     dc.bold()
                 );
             }
@@ -501,7 +557,7 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
 
-        Command::As { user, password, password_stdin, realm, salt, etype, dc, port } => {
+        Command::As { user, password, password_stdin, realm, salt, etype, renewable, dc, port } => {
             let c = conn(&dc, port);
             let password = resolve_password(password, password_stdin)?;
             let salt = match salt {
@@ -509,18 +565,77 @@ fn run(cli: Cli) -> Result<(), String> {
                 None => learn_salt(&c, &user, &realm)?,
             };
             let key = key_from_credentials(&user, &realm, &salt, &password, None, None)?;
-            let tgt = charon_client::request_tgt(&c, &user, &realm, &key, &[etype.id()], 0)
-                .map_err(|e| e.to_string())?;
+            let tgt = if renewable {
+                let till = charon_asn1::KrbTime::now().plus_secs(7 * 86_400);
+                charon_client::request_tgt_renewable(&c, &user, &realm, &key, &[etype.id()], till)
+                    .map_err(|e| e.to_string())?
+            } else {
+                charon_client::request_tgt(&c, &user, &realm, &key, &[etype.id()], 0)
+                    .map_err(|e| e.to_string())?
+            };
+            let renew_note = if renewable {
+                format!(", renovable hasta {}", tgt.renew_till.map(|t| t.to_string()).unwrap_or_default())
+            } else {
+                String::new()
+            };
             println!(
-                "{} TGT {} → {}, sesión etype {}, caduca {}",
+                "{} TGT {} → {}, sesión etype {}, caduca {}{}",
                 "AS:".bold(),
                 format!("{user}@{realm}").cyan(),
                 tgt.ticket.sname.flat().yellow(),
                 tgt.session_key.keytype,
-                tgt.endtime
+                tgt.endtime,
+                renew_note
             );
             let node = charon_trace::trace_kdc_rep(&tgt.raw_reply, Some(&key)).map_err(|e| e.to_string())?;
             println!("\n{}", charon_trace::render_text(&node));
+            Ok(())
+        }
+
+        Command::Renew { user, password, password_stdin, realm, salt, renew_hours, dc, port, trace } => {
+            let c = conn(&dc, port);
+            let password = resolve_password(password, password_stdin)?;
+            let salt = match salt {
+                Some(s) => s,
+                None => learn_salt(&c, &user, &realm)?,
+            };
+            let key = key_from_credentials(&user, &realm, &salt, &password, None, None)?;
+            // Acotado antes del cast a i64: saturating_mul en u64 aún puede
+            // producir u64::MAX y "as i64" lo volvería negativo (till en el
+            // pasado, el KDC lo rechazaría con un mensaje incomprensible).
+            let till = charon_asn1::KrbTime::now()
+                .plus_secs(renew_hours.saturating_mul(3_600).min(i64::MAX as u64) as i64);
+            let tgt = charon_client::request_tgt_renewable(&c, &user, &realm, &key, &[etype_mod::AES256_CTS_HMAC_SHA1_96], till)
+                .map_err(|e| format!("no se pudo obtener el TGT renovable: {e}"))?;
+            if tgt.flags & charon_krb5::ticket_flags::RENEWABLE == 0 {
+                return fail(
+                    "el KDC no concedió el flag RENEWABLE (revisa max_renewable_life del KDC)".into(),
+                );
+            }
+            println!(
+                "{} TGT renovable {} → caduca {}, renovable hasta {}",
+                "renew:".bold(),
+                format!("{user}@{realm}").cyan(),
+                tgt.endtime.to_string().yellow(),
+                tgt.renew_till.map(|t| t.to_string()).unwrap_or_default()
+            );
+            let renewed = charon_client::renew_tgt(&c, &tgt, till)
+                .map_err(|e| format!("renovación rechazada por el KDC: {e}"))?;
+            println!(
+                "{} renovado → caduca {} (authtime conservada: {}, nueva clave de sesión etype {})",
+                "  ↳".green(),
+                renewed.endtime.to_string().yellow(),
+                renewed.authtime,
+                renewed.session_key.keytype
+            );
+            if trace {
+                // El enc-part del TGS-REP va con la clave de sesión del TGT
+                // ORIGINAL (usage 8): eso es lo que el trace necesita.
+                let sess = KerberosKey::from_raw(tgt.session_key.keytype, &tgt.session_key.keyvalue)
+                    .map_err(|e| e.to_string())?;
+                let node = charon_trace::trace_kdc_rep(&renewed.raw_reply, Some(&sess)).map_err(|e| e.to_string())?;
+                println!("\n{}", charon_trace::render_text(&node));
+            }
             Ok(())
         }
 
@@ -576,7 +691,20 @@ fn run(cli: Cli) -> Result<(), String> {
             );
             // El ticket va cifrado con la clave larga del servicio: al
             // descifrarlo, el PAC muestra la identidad suplantada.
-            match charon_krb5::pac::extract_pac(&st.ticket, &key) {
+            // El KDC ELIGE el etype del ticket: con cuentas que tienen RC4
+            // puede emitirlo en 23 aunque el analista haya derivado AES256
+            // (lección del lab: jdoe con arcfour restaurado → ticket S4U en
+            // RC4). La clave de descifrado se elige según el etype REAL del
+            // ticket, como hacen impacket/Rubeus.
+            let pac_key = if st.ticket.enc_part.etype == etype_mod::RC4_HMAC
+                && key.etype() != etype_mod::RC4_HMAC
+            {
+                KerberosKey::from_password(&password, &salt, etype_mod::RC4_HMAC)
+                    .map_err(|e| format!("no pude derivar la clave RC4 del servicio: {e}"))?
+            } else {
+                key
+            };
+            match charon_krb5::pac::extract_pac(&st.ticket, &pac_key) {
                 Ok(pac) => match pac.client_info() {
                     Some((_, name)) => println!("  PAC CLIENT INFO: {}", name.green()),
                     None => println!("  PAC buffers: {:?}", pac.buffers.iter().map(|b| b.buffer_type).collect::<Vec<_>>()),
@@ -654,6 +782,39 @@ fn resolve_users(input: &[String]) -> Result<Vec<String>, String> {
         } else {
             out.push(item.clone());
         }
+    }
+    Ok(out)
+}
+
+/// Carga un fichero de pares `usuario:contraseña` (uno por línea) para
+/// el spray por pares. Se acepta ruta directa o "@ruta" (misma forma
+/// que --users). Reglas: '#' comenta la línea; la contraseña puede
+/// contener ':' (se parte en el primero); los espacios de los extremos
+/// de la línea y de la contraseña se recortan — es formato de
+/// laboratorio: para contraseñas con espacios significativos, usa el
+/// modo clásico con --password-stdin. Los errores señalan el número de
+/// línea (falla pronto, no a mitad de spray).
+fn resolve_pairs(spec: &str) -> Result<Vec<(String, String)>, String> {
+    let path = spec.strip_prefix('@').unwrap_or(spec);
+    let content = std::fs::read_to_string(path).map_err(|e| format!("no pude leer {path}: {e}"))?;
+    let mut out = Vec::new();
+    for (n, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((u, pw)) = line.split_once(':') else {
+            return Err(format!("línea {}: falta ':' — formato usuario:contraseña", n + 1));
+        };
+        let u = u.trim();
+        let pw = pw.trim();
+        if u.is_empty() {
+            return Err(format!("línea {}: usuario vacío", n + 1));
+        }
+        if pw.is_empty() {
+            return Err(format!("línea {}: contraseña vacía (¿línea incompleta?)", n + 1));
+        }
+        out.push((u.to_string(), pw.to_string()));
     }
     Ok(out)
 }
@@ -787,4 +948,55 @@ fn etype_name(id: i32) -> &'static str {
 #[allow(dead_code)]
 fn _ensure_stdout_flushed() {
     let _ = std::io::stdout().flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_file(name: &str, content: &str) -> String {
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, content).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn resolve_pairs_acepta_comentarios_dos_puntos_en_clave_y_crlf() {
+        let path = tmp_file(
+            "charon-test-pairs-ok.txt",
+            "# lista del lab\r\njdoe:Jdoe!Pass42\r\naesuser:con:dos:ultimos\n\n  legacy:  con espacios  \n",
+        );
+        let pairs = resolve_pairs(&path).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                ("jdoe".to_string(), "Jdoe!Pass42".to_string()),
+                ("aesuser".to_string(), "con:dos:ultimos".to_string()),
+                ("legacy".to_string(), "con espacios".to_string()),
+            ]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn resolve_pairs_falla_con_numero_de_linea_si_faltan_los_dos_puntos() {
+        let path = tmp_file("charon-test-pairs-mal.txt", "jdoe:buena\nlinea-rompida\n");
+        let err = resolve_pairs(&path).unwrap_err();
+        assert!(err.contains("línea 2"), "debe señalar la línea concreta: {err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn resolve_pairs_rechaza_usuario_o_contrasena_vacios() {
+        let path = tmp_file("charon-test-pairs-vacios.txt", "jdoe:buena\n:sin-usuario\n");
+        let err = resolve_pairs(&path).unwrap_err();
+        assert!(err.contains("línea 2") && err.contains("usuario vacío"), "{err}");
+
+        let path2 = tmp_file("charon-test-pairs-vacios2.txt", "jdoe:\n");
+        let err2 = resolve_pairs(&path2).unwrap_err();
+        assert!(err2.contains("contraseña vacía"), "{err2}");
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&path2).ok();
+    }
 }

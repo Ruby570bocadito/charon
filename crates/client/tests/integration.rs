@@ -224,6 +224,60 @@ fn t10_udp_tcp_strategy_and_response_sizes() {
     assert!(reply.len() > 100, "respuesta demasiado corta");
 }
 
+/// Ronda 2 del sistema de agentes: TGT renovable + renovación real
+/// (RFC 4120 §3.3.3). La renovación se distingue de un TGS normal
+/// porque el KDC CONSERVA la authtime; el flag RENEWABLE del ticket
+/// renovado se concede porque se pide (RFC 4120 §3.1.3).
+#[test]
+fn t11_renewable_tgt_and_renew() {
+    let _guard = lock();
+    if !kdc_available() {
+        eprintln!("SKIP: KDC no disponible");
+        return;
+    }
+    let key = KerberosKey::from_password("Jdoe!Pass42", "LAB.LOCALjdoe", etype::AES256_CTS_HMAC_SHA1_96).unwrap();
+    let till = charon_asn1::KrbTime::now().plus_secs(7 * 86_400);
+    let tgt = request_tgt_renewable(&conn(), "jdoe", REALM, &key, &[18], till).unwrap();
+    assert_eq!(
+        tgt.flags & charon_krb5::ticket_flags::RENEWABLE,
+        charon_krb5::ticket_flags::RENEWABLE,
+        "el KDC debe conceder RENEWABLE (max_renewable_life=7d en el lab)"
+    );
+    let renew_till = tgt.renew_till.expect("un TGT renovable trae renew-till");
+    assert!(renew_till.unix_secs <= till.plus_secs(60).unix_secs, "el KDC recorta rtime a max_renewable_life (7d)");
+
+    let renewed = renew_tgt(&conn(), &tgt, till).expect("la renovación debe aceptarse");
+    assert_eq!(renewed.authtime, tgt.authtime, "la renovación conserva la authtime original (prueba de que el KDC aplicó RENEW)");
+    assert_eq!(renewed.cname, "jdoe");
+    assert_eq!(renewed.ticket.sname.name_string, vec!["krbtgt", "LAB.LOCAL"]);
+    assert!(
+        renewed.flags & charon_krb5::ticket_flags::RENEWABLE != 0,
+        "el ticket renovado sigue renovable (RENEWABLE pedido: RFC 4120 §3.1.3)"
+    );
+    assert!(renewed.endtime.unix_secs <= renewed.renew_till.unwrap_or(renew_till).unix_secs, "endtime dentro de la ventana");
+    assert_ne!(
+        renewed.session_key.keyvalue, tgt.session_key.keyvalue,
+        "una renovación emite una clave de sesión fresca"
+    );
+}
+
+/// La renovación de un TGT NO renovable debe ser rechazada: pedimos un
+/// TGT normal (sin RENEWABLE) y renueva → KDC_ERR_BADOPTION (13).
+#[test]
+fn t12_renew_rejected_for_non_renewable_tgt() {
+    let _guard = lock();
+    if !kdc_available() {
+        eprintln!("SKIP: KDC no disponible");
+        return;
+    }
+    let key = KerberosKey::from_password("Jdoe!Pass42", "LAB.LOCALjdoe", etype::AES256_CTS_HMAC_SHA1_96).unwrap();
+    let tgt = request_tgt(&conn(), "jdoe", REALM, &key, &[18], kdc_options::FORWARDABLE).unwrap();
+    let till = charon_asn1::KrbTime::now().plus_secs(7 * 86_400);
+    let err = renew_tgt(&conn(), &tgt, till).expect_err("renovar un TGT no renovable debe fallar");
+    let msg = err.to_string();
+    assert!(msg.contains("BADOPTION") || msg.contains("13"), "el KDC debe responder BADOPTION(13): {msg}");
+}
+
 fn other_desc(p: &AsProbe) -> String {
     match p {
         AsProbe::PreauthRequired { .. } => "PreauthRequired".to_string(),

@@ -231,3 +231,18 @@ fn spn_and_error_descriptions() {
     let d = error_codes::describe(13);
     assert!(d.leak.contains("S4U2Proxy"));
 }
+
+#[test]
+fn kdc_options_coinciden_con_las_constantes_de_mit_krb5h() {
+    // Regresión de la ronda 2: CANONICALIZE estaba en bit(22) (un bit
+    // "unused" del RFC 4120) en vez de bit(15). El RFC lo fija en la nota
+    // ASN.1 "15 is reserved for canonicalize" y MIT krb5.h en 0x00010000.
+    // El bit() del repo cuenta desde el MSB del BIT STRING (bit 0 =
+    // 0x80000000), como exige la codificación ASN.1 de Kerberos.
+    assert_eq!(kdc_options::FORWARDABLE, 0x4000_0000);
+    assert_eq!(kdc_options::PROXIABLE, 0x1000_0000);
+    assert_eq!(kdc_options::RENEWABLE, 0x0080_0000);
+    assert_eq!(kdc_options::CANONICALIZE, 0x0001_0000);
+    assert_eq!(kdc_options::RENEW, 0x0000_0002);
+    assert_eq!(kdc_options::C_NAME_IN_ADDITIONAL_TICKET, 0x0000_0010);
+}

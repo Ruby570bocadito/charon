@@ -34,7 +34,8 @@ Las herramientas actuales tratan Kerberos como caja negra:
   real, builders/parsers de AS/TGS/AP/KRB-ERROR/PAC.
 - **Primitivos ofensivos (M2)**: enumeración de usuarios, kerberoasting
   **AES-first** (sin downgrade → sin evento 4769 con 0x17), AS-REP roasting,
-  pass-the-key y S4U2Self, con control total de etypes, PA-DATA y flags.
+  pass-the-key, S4U2Self y **renovación de TGT** (RFC 4120 §3.3.3), con
+  control total de etypes, PA-DATA y flags.
 - **Trace (M3)**: cada mensaje decodificado campo a campo, con explicación
   en español y referencia al RFC — texto coloreado o JSON.
 - **Matriz KDC (M4)**: batería de sondas válidas, casi válidas y
@@ -139,6 +140,15 @@ charon passthekey --user jdoe --nt-hash 684d49a1... -r LAB.LOCAL --dc 10.0.0.1
 charon spray --users @cuentas.txt -p 'Candidata2026!' -r LAB.LOCAL --dc 10.0.0.1 \
     --delay-ms 500 --output aciertos.tsv
 
+# Spray por pares: cada usuario con SU contraseña (fichero usuario:contraseña,
+# '#' comenta; el fichero queda con secretos en claro — chmod 600)
+charon spray --pairs pares.txt -r LAB.LOCAL --dc 10.0.0.1
+
+# TGT renovable + renovación real (kinit -r / kinit -R del protocolo):
+# la renovación conserva la authtime y extiende el endtime dentro del renew-till
+charon as --user jdoe -r LAB.LOCAL --renewable          # pedirlo renovable
+charon renew --user jdoe -r LAB.LOCAL --renew-hours 168  # renovarlo por el cable
+
 # S4U2Self: ticket en nombre de otro usuario (para ver el PAC delegado)
 charon s4u2self --user jdoe --impersonate aesuser -r LAB.LOCAL --dc 10.0.0.1
 
@@ -188,8 +198,8 @@ charon/
 │   ├── asn1/                # codec DER propio (ADR-001) + cross-check openssl
 │   ├── kcrypto/             # crypto RFC: n-fold, DK, CTS, RC4-HMAC, AES (ADR-003)
 │   ├── krb5/                # mensajes AS/TGS/AP/KRB-ERROR + PAC (MS-PAC)
-│   ├── client/              # transporte UDP/TCP:88, sesión KDC, S4U2Self
-│   ├── attacks/             # enum, kerberoast, asreproast, pass-the-key + hashcat
+│   ├── client/              # transporte UDP/TCP:88, sesión KDC, S4U2Self, renovación TGT
+│   ├── attacks/             # enum, kerberoast, asreproast, pass-the-key, spray + hashcat
 │   ├── trace/               # decodificación campo a campo (texto/JSON)
 │   ├── matrix/              # runner de la matriz KDC → dataset JSON
 │   └── charon/              # el binario CLI

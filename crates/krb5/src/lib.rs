@@ -353,7 +353,10 @@ pub mod kdc_options {
     pub const FORWARDABLE: u32 = bit(1);
     pub const PROXIABLE: u32 = bit(3);
     pub const RENEWABLE: u32 = bit(8);
-    pub const CANONICALIZE: u32 = bit(22);
+    /// RFC 4120 §5.2.2 (nota ASN.1: "15 is reserved for canonicalize").
+    pub const CANONICALIZE: u32 = bit(15);
+    /// RFC 4120 §5.2.2: renovación de un ticket RENEWABLE existente.
+    pub const RENEW: u32 = bit(30);
     /// S4U2Proxy: el cname va en el additional-ticket (MS-SFU §2.2.2).
     pub const C_NAME_IN_ADDITIONAL_TICKET: u32 = bit(27);
 }
