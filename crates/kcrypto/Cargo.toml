@@ -1,0 +1,25 @@
+[package]
+name = "charon-kcrypto"
+description = "Crypto Kerberos RFC-conformante: RC4-HMAC (RFC 4757) y AES-CTS-HMAC-SHA1 (RFC 3961/3962) — ADR-003"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+charon-asn1.workspace = true
+# Primitivos auditados de RustCrypto (ADR-003: prohibido reimplementarlos)
+aes.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+md4.workspace = true
+md-5.workspace = true
+rc4.workspace = true
+pbkdf2.workspace = true
+cipher.workspace = true
+digest.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hex = "0.4"
