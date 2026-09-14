@@ -1,0 +1,23 @@
+[package]
+name = "charon"
+description = "CHARON — workbench del protocolo Kerberos: implementa el wire format, ejecuta los primitivos ofensivos con control total y explica cada mensaje campo a campo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "charon"
+path = "src/main.rs"
+
+[dependencies]
+charon-asn1.workspace = true
+charon-kcrypto.workspace = true
+charon-krb5.workspace = true
+charon-client.workspace = true
+charon-attacks.workspace = true
+charon-trace.workspace = true
+charon-matrix.workspace = true
+clap.workspace = true
+owo-colors.workspace = true
+serde_json.workspace = true
+hex.workspace = true

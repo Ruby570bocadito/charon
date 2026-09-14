@@ -1,0 +1,1 @@
+[1m[31merror:[39m[0m E/S con el KDC: failed to fill whole buffer

@@ -113,6 +113,7 @@ impl Tag {
                 (5, _) => "NULL".into(),
                 (16, _) => "SEQUENCE".into(),
                 (24, _) => "GeneralizedTime".into(),
+                (27, _) => "GeneralString".into(),
                 _ => format!("universal #{}, {shape}", self.number),
             },
             Class::Application => format!("[APPLICATION {}] ({shape})", self.number),
@@ -191,9 +192,11 @@ pub fn encode_octets(bytes: &[u8]) -> Vec<u8> {
     encode_tlv(Tag::OCTET_STRING, bytes).expect("tag universal")
 }
 
-/// KerberosString (GeneralString: se codifica como octetos UTF-8).
+/// KerberosString: RFC 4120 §5.2.1 la define como GeneralString (tag
+/// universal 27). El contenido son los octetos del nombre tal cual.
 pub fn encode_string(s: &str) -> Vec<u8> {
-    encode_octets(s.as_bytes())
+    encode_tlv(Tag { class: Class::Universal, constructed: false, number: 27 }, s.as_bytes())
+        .expect("tag universal")
 }
 
 /// BIT STRING alineada (0 bits sin usar) para contenido arbitrario.
@@ -288,8 +291,20 @@ impl<'a> Element<'a> {
         Ok(self.content)
     }
 
+    /// Contenido como UTF-8. Acepta GeneralString (0x1b, la forma de RFC
+    /// 4120 §5.2.1) y OCTET STRING (0x04, la que envían algunas
+    /// implementaciones antiguas: RFC 4120 recomienda aceptarla).
     pub fn parse_str(&self) -> Result<&'a str> {
-        std::str::from_utf8(self.parse_bytes()?).map_err(|_| Asn1Error::BadUtf8)
+        self.expect_universal(27)?;
+        std::str::from_utf8(self.content).map_err(|_| Asn1Error::BadUtf8)
+    }
+
+    /// Igual que `parse_str` pero aceptando también OCTET STRING (0x04).
+    pub fn parse_str_lenient(&self) -> Result<&'a str> {
+        if self.tag.class == Class::Universal && self.tag.number == 4 {
+            return std::str::from_utf8(self.content).map_err(|_| Asn1Error::BadUtf8);
+        }
+        self.parse_str()
     }
 
     /// BIT STRING → (bytes, bits_sin_usar).

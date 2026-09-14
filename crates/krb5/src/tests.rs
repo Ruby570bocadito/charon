@@ -115,9 +115,11 @@ fn krb_error_roundtrip_with_etype_info2() {
         salt: Some(b"LAB.LOCALjdoe".to_vec()),
         s2kparams: None,
     };
+    // El valor de PA-ETYPE-INFO2 es ETYPE-INFO2 ::= SEQUENCE OF entry.
+    let etype_info2 = encode_sequence(&[entry.build().unwrap()]).unwrap();
     let method_data = PaData::build_seq(&[PaData {
         pa_type: pa_type::PA_ETYPE_INFO2,
-        pa_value: entry.build().unwrap(),
+        pa_value: etype_info2,
     }])
     .unwrap();
     let err = KrbError {

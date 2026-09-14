@@ -39,6 +39,9 @@ pub mod usage {
     pub const AS_REP_ENCPART: u32 = 3;
     /// Authenticator del AP-REQ dentro del TGS-REQ, con la clave de sesión del TGT.
     pub const TGS_REQ_AUTH: u32 = 7;
+    /// Checksum del authenticator en el TGS-REQ, con la clave de sesión
+    /// del TGT (MIT 1.21 y Windows lo exigen).
+    pub const TGS_REQ_AUTH_CKSUM: u32 = 6;
     /// TGS-REP enc-part, con la clave de sesión del TGT.
     pub const TGS_REP_ENCPART_SESSKEY: u32 = 8;
     /// TGS-REP enc-part, con el subkey del authenticator (raro; errata RC4 8/9).
@@ -151,9 +154,15 @@ pub fn random_bytes(n: usize) -> Result<Vec<u8>> {
 }
 
 /// u32 aleatorio (nonces de AS-REQ/TGS-REQ).
+///
+/// Enmascarado a 31 bits a propósito: MIT y Heimdal codifican el nonce
+/// como **con signo** ("We and Heimdal incorrectly encode nonces as
+/// signed", k5_generate_nonce) y su decodificador rechaza con
+/// ASN1_OVERFLOW un INTEGER de 5 bytes. Un nonce con el bit alto puesto
+/// provocaría descartes intermitentes del 50% de las peticiones.
 pub fn random_u32() -> Result<u32> {
     let b = random_bytes(4)?;
-    Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]) & 0x7FFF_FFFF)
 }
 
 /// Comparación en tiempo constante para verificar checksums.

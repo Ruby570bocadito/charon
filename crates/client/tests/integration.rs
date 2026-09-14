@@ -4,8 +4,15 @@
 //! aceptados por una implementación de referencia. Si el KDC no está
 //! levantado, se saltan con instrucciones (no son fallos del código).
 
+use std::sync::Mutex;
+
 use charon_client::*;
 use charon_krb5::kdc_options;
+use charon_krb5::Krb5Error;
+
+// El KDC del laboratorio es de un solo hilo y su detector de replay de
+// preauth es sensible a la concurrencia: la batería corre en serie.
+static KDC_LOCK: Mutex<()> = Mutex::new(());
 use charon_kcrypto::{etype, KerberosKey};
 
 const HOST: &str = "127.0.0.1";
@@ -13,21 +20,32 @@ const PORT: u16 = 1088;
 const REALM: &str = "LAB.LOCAL";
 
 fn kdc_available() -> bool {
+    // Sondea con un AS-REQ REAL (a un usuario inexistente): enviar basura
+    // no sirve porque el KDC no responde a mensajes inválidos.
     let conn = KdcConnection::new(HOST, PORT);
-    conn.send_udp(&[0x00; 8]).is_ok() || conn.send_tcp(&[0x00; 8]).is_ok()
+    match charon_client::probe_as_no_preauth(&conn, "kdc-disponible-sonda", REALM, &[18]) {
+        Ok(_) => true,
+        Err(ClientError::Krb5(Krb5Error::BadReply(_))) => true,
+        Err(_) => false,
+    }
 }
 
 fn conn() -> KdcConnection {
     KdcConnection::new(HOST, PORT)
 }
 
+fn lock() -> std::sync::MutexGuard<'static, ()> {
+    KDC_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn t01_unknown_user_returns_error_6() {
+    let _guard = lock();
     if !kdc_available() {
         eprintln!("SKIP: KDC no disponible — ejecuta lab/setup-mit-kdc.sh");
         return;
     }
-    let probe = probe_as_no_preauth(&conn(), "ghost-inexistente", REALM, &[23]).unwrap();
+    let probe = probe_as_no_preauth(&conn(), "ghost-inexistente", REALM, &[18, 23]).unwrap();
     match probe {
         AsProbe::PrincipalUnknown { .. } => {}
         other => panic!("esperaba PrincipalUnknown, obtuve {:?}", other_desc(&other)),
@@ -36,6 +54,7 @@ fn t01_unknown_user_returns_error_6() {
 
 #[test]
 fn t02_existing_user_returns_25_and_salt() {
+    let _guard = lock();
     if !kdc_available() {
         eprintln!("SKIP: KDC no disponible");
         return;
@@ -55,6 +74,7 @@ fn t02_existing_user_returns_25_and_salt() {
 
 #[test]
 fn t03_nopreauth_account_is_roasteable() {
+    let _guard = lock();
     if !kdc_available() {
         eprintln!("SKIP: KDC no disponible");
         return;
@@ -72,12 +92,16 @@ fn t03_nopreauth_account_is_roasteable() {
 
 #[test]
 fn t04_tgt_with_rc4() {
+    let _guard = lock();
     if !kdc_available() {
         eprintln!("SKIP: KDC no disponible");
         return;
     }
     let key = KerberosKey::from_password("Jdoe!Pass42", "LAB.LOCALjdoe", etype::RC4_HMAC).unwrap();
-    let tgt = request_tgt(&conn(), "jdoe", REALM, &key, &[23], kdc_options::FORWARDABLE | kdc_options::RENEWABLE).unwrap();
+    // El preauth viaja cifrado con la clave RC4 (etype 23 en el
+    // EncryptedData); pedimos también 18 porque MIT 1.21 exige un etype
+    // de sesión no deprecado en la lista.
+    let tgt = request_tgt(&conn(), "jdoe", REALM, &key, &[23, 18], kdc_options::FORWARDABLE | kdc_options::RENEWABLE).unwrap();
     assert_eq!(tgt.crealm, REALM);
     assert_eq!(tgt.cname, "jdoe");
     assert_eq!(tgt.ticket.sname.name_string, vec!["krbtgt", "LAB.LOCAL"]);
@@ -87,6 +111,7 @@ fn t04_tgt_with_rc4() {
 
 #[test]
 fn t05_tgt_with_aes256() {
+    let _guard = lock();
     if !kdc_available() {
         eprintln!("SKIP: KDC no disponible");
         return;
@@ -101,17 +126,19 @@ fn t05_tgt_with_aes256() {
 
 #[test]
 fn t06_wrong_password_returns_preauth_failed() {
+    let _guard = lock();
     if !kdc_available() {
         eprintln!("SKIP: KDC no disponible");
         return;
     }
-    let key = KerberosKey::from_password("Contrasena!Incorrecta", "LAB.LOCALjdoe", etype::RC4_HMAC).unwrap();
-    let err = request_tgt(&conn(), "jdoe", REALM, &key, &[23], 0).unwrap_err();
+    let key = KerberosKey::from_password("Contrasena!Incorrecta", "LAB.LOCALjdoe", etype::AES256_CTS_HMAC_SHA1_96).unwrap();
+    let err = request_tgt(&conn(), "jdoe", REALM, &key, &[18], 0).unwrap_err();
     assert!(format!("{err}").contains("PREAUTH_FAILED"), "error inesperado: {err}");
 }
 
 #[test]
 fn t07_pass_the_key_with_nt_hash() {
+    let _guard = lock();
     if !kdc_available() {
         eprintln!("SKIP: KDC no disponible");
         return;
@@ -121,12 +148,13 @@ fn t07_pass_the_key_with_nt_hash() {
     let utf16: Vec<u8> = "Jdoe!Pass42".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     let nt = charon_kcrypto::rc4hmac::nt_hash(&utf16);
     let key = KerberosKey::from_raw(etype::RC4_HMAC, &nt).unwrap();
-    let tgt = request_tgt(&conn(), "jdoe", REALM, &key, &[23], 0).unwrap();
+    let tgt = request_tgt(&conn(), "jdoe", REALM, &key, &[23, 18], 0).unwrap();
     assert_eq!(tgt.cname, "jdoe");
 }
 
 #[test]
 fn t08_tgs_aes_first_and_rc4_only() {
+    let _guard = lock();
     if !kdc_available() {
         eprintln!("SKIP: KDC no disponible");
         return;
@@ -152,6 +180,7 @@ fn t08_tgs_aes_first_and_rc4_only() {
 
 #[test]
 fn t09_pac_extractable_from_service_ticket() {
+    let _guard = lock();
     if !kdc_available() {
         eprintln!("SKIP: KDC no disponible");
         return;
@@ -159,17 +188,23 @@ fn t09_pac_extractable_from_service_ticket() {
     // Pedimos el ticket de servicio de nuestra propia cuenta de servicio
     // (cuya clave larga conocemos en el lab) y desciframos el ticket con
     // ella (usage 2) para leer el PAC de jdoe: el flujo de análisis de PAC.
-    let svc_key = KerberosKey::from_password("Mssql!Svc01", "LAB.LOCALmssql/srv01.lab.local", etype::AES256_CTS_HMAC_SHA1_96).unwrap();
+    let svc_key = KerberosKey::from_password("Mssql!Svc01", "LAB.LOCALmssqlsrv01.lab.local", etype::AES256_CTS_HMAC_SHA1_96).unwrap();
     let user_key = KerberosKey::from_password("Jdoe!Pass42", "LAB.LOCALjdoe", etype::AES256_CTS_HMAC_SHA1_96).unwrap();
     let user_tgt = request_tgt(&conn(), "jdoe", REALM, &user_key, &[18], 0).unwrap();
     let st = request_service_ticket(&conn(), &user_tgt, "mssql/srv01.lab.local", &[18, 17], 0).unwrap();
     let pac = charon_krb5::pac::extract_pac(&st.ticket, &svc_key);
     match pac {
         Ok(p) => {
-            let info = p.logon_info().expect("el PAC debe llevar LOGON_INFO");
-            assert_eq!(info.account, "jdoe", "el PAC identifica al usuario autenticado");
-            assert!(info.user_rid > 1000);
-            assert!(!info.groups.is_empty());
+            // MIT 1.21 emite un PAC minimalista (client-info + checksums,
+            // SIN LOGON_INFO): fingerprint vs AD, que siempre lo incluye.
+            // Lo que debe haber SIEMPRE es la identidad del cliente.
+            let (_, name) = p.client_info().expect("el PAC debe llevar CLIENT INFO");
+            assert_eq!(name, "jdoe", "el PAC identifica al usuario autenticado");
+            assert!(!p.signatures().is_empty(), "el PAC debe llevar firmas");
+            // LOGON_INFO con RID/grupos existe en AD; MIT la omite.
+            if let Some(info) = p.logon_info() {
+                assert_eq!(info.account, "jdoe");
+            }
         }
         Err(e) => panic!("no se pudo extraer el PAC: {e}"),
     }
@@ -177,6 +212,7 @@ fn t09_pac_extractable_from_service_ticket() {
 
 #[test]
 fn t10_udp_tcp_strategy_and_response_sizes() {
+    let _guard = lock();
     if !kdc_available() {
         eprintln!("SKIP: KDC no disponible");
         return;

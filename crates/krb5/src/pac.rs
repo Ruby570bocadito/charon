@@ -17,14 +17,24 @@
 
 use crate::{Krb5Error, Result};
 
+/// Tipos de buffer. ⚠ MS-PAC §2.4 y MIT difieren en algunos números:
+/// MS: logon=1, server-cksum=3, kdc-cksum=4, client-name=5, client-info=6,
+///     delegation=7, upn-dns=8, attributes=16, requestor=19.
+/// MIT 1.21: client-info=10, server-cksum=6, kdc-cksum=7,
+///     ticket-cksum=16, full-cksum=19, y OMITE el LOGON_INFO.
+/// El parseo de Charon acepta ambas familias (otro hallazgo de la matriz).
 pub mod pac_type {
     pub const LOGON_INFO: u32 = 1;
-    pub const SERVER_CHECKSUM: u32 = 3;
-    pub const KDC_CHECKSUM: u32 = 4;
+    pub const SERVER_CHECKSUM_MS: u32 = 3;
+    pub const KDC_CHECKSUM_MS: u32 = 4;
     pub const CLIENT_NAME: u32 = 5;
-    pub const CLIENT_INFO: u32 = 6;
+    pub const CLIENT_INFO_MS: u32 = 6;
+    pub const SERVER_CHECKSUM_MIT: u32 = 6;
+    pub const KDC_CHECKSUM_MIT: u32 = 7;
     pub const UPN_DNS_INFO: u32 = 8;
-    pub const S4U_DELEGATION_INFO: u32 = 12;
+    pub const CLIENT_INFO_MIT: u32 = 10;
+    pub const TICKET_CHECKSUM_MIT: u32 = 16;
+    pub const FULL_CHECKSUM_MIT: u32 = 19;
 }
 
 /// Un buffer del PAC, crudo por tipo.
@@ -79,22 +89,38 @@ impl Pac {
             .and_then(|b| LogonInfo::parse(&b.data).ok())
     }
 
+    /// Firmas presentes (MS: tipos 3/4; MIT: tipos 6/7).
     pub fn signatures(&self) -> Vec<(u32, PacSignature)> {
         self.buffers
             .iter()
-            .filter(|b| b.buffer_type == pac_type::SERVER_CHECKSUM || b.buffer_type == pac_type::KDC_CHECKSUM)
+            .filter(|b| {
+                matches!(
+                    b.buffer_type,
+                    pac_type::SERVER_CHECKSUM_MS
+                        | pac_type::KDC_CHECKSUM_MS
+                        | pac_type::SERVER_CHECKSUM_MIT
+                        | pac_type::KDC_CHECKSUM_MIT
+                )
+            })
             .filter_map(|b| PacSignature::parse(&b.data).ok().map(|s| (b.buffer_type, s)))
             .collect()
     }
 
-    pub fn client_name(&self) -> Option<(u64, String)> {
-        let b = self.buffers.iter().find(|b| b.buffer_type == pac_type::CLIENT_NAME)?;
-        if b.data.len() < 12 {
+    /// CLIENT INFO (MS tipo 5/6 o MIT tipo 10): timestamp + nombre del cliente.
+    pub fn client_info(&self) -> Option<(u64, String)> {
+        let b = self.buffers.iter().find(|b| {
+            matches!(
+                b.buffer_type,
+                pac_type::CLIENT_NAME | pac_type::CLIENT_INFO_MS | pac_type::CLIENT_INFO_MIT
+            )
+        })?;
+        if b.data.len() < 10 {
             return None;
         }
         let client_id = u64::from_le_bytes(b.data[0..8].try_into().ok()?);
-        let name_len = u32::from_le_bytes(b.data[8..12].try_into().ok()?) as usize;
-        let raw = b.data.get(12..12 + name_len)?;
+        // NameLength es un USHORT en MS-PAC/§Client Info.
+        let name_len = u16::from_le_bytes(b.data[8..10].try_into().ok()?) as usize;
+        let raw = b.data.get(10..10 + name_len)?;
         let name: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes(c.try_into().unwrap())).collect();
         Some((client_id, String::from_utf16_lossy(&name)))
     }

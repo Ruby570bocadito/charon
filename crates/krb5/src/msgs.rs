@@ -189,8 +189,11 @@ pub const MSG_KRB_ERROR: u32 = 30;
 impl KdcReq {
     pub fn build(&self) -> Result<Vec<u8>> {
         let tag = if self.msg_type == MSG_AS_REQ { TAG_AS_REQ } else { TAG_TGS_REQ };
-        let pvno = ctx_int(0, 5);
-        let msg_type = ctx_int(1, self.msg_type as i64);
+        // ⚠ RFC 4120 §5.4.1: a diferencia de KDC-REP y KRB-ERROR, KDC-REQ
+        // empieza en [1] (el RFC lo advierte: "NOTE: first tag is [1], not
+        // [0]"). MIT y Windows codifican así en el cable.
+        let pvno = ctx_int(1, 5);
+        let msg_type = ctx_int(2, self.msg_type as i64);
         let padata = if self.padata.is_empty() {
             None
         } else {
@@ -218,11 +221,11 @@ impl KdcReq {
         let body_el = seq.next_tag(Tag::SEQUENCE)?;
         seq.finish()?;
         let mut fields = body_el.parse_seq()?;
-        let pvno = fields.context_child_req(0)?.unwrap_context()?.parse_int_u32()?;
+        let pvno = fields.context_child_req(1)?.unwrap_context()?.parse_int_u32()?;
         if pvno != 5 {
             return Err(Krb5Error::BadPvno(pvno as i64));
         }
-        let mt = fields.context_child_req(1)?.unwrap_context()?.parse_int_u32()?;
+        let mt = fields.context_child_req(2)?.unwrap_context()?.parse_int_u32()?;
         if mt != msg_type {
             return Err(Krb5Error::BadMsgType(mt as i64));
         }
@@ -348,11 +351,25 @@ impl EncKdcRepPart {
     }
 
     /// Parse desde bytes crudos descifrados (el contenido del enc-part).
+    ///
+    /// RFC 4120 §5.4.2: el interior de un AS-REP llega envuelto como
+    /// `EncASRepPart ::= [APPLICATION 25] EncKDCRepPart` y el de un
+    /// TGS-REP como `EncTGSRepPart ::= [APPLICATION 26] EncKDCRepPart`.
+    /// Algunas implementaciones envían la SEQUENCE desnuda: se aceptan
+    /// las tres formas.
     pub fn parse_element(bytes: &[u8]) -> Result<EncKdcRepPart> {
         let mut r = charon_asn1::DerReader::new(bytes);
         let el = r.next()?.ok_or(charon_asn1::Asn1Error::TrailingBytes(0))?;
         r.finish()?;
-        EncKdcRepPart::parse(&el)
+        let wrapped = el.tag.class == charon_asn1::Class::Application;
+        if wrapped {
+            let mut outer = el.content_reader();
+            let body = outer.next_tag(charon_asn1::Tag::SEQUENCE)?;
+            outer.finish()?;
+            EncKdcRepPart::parse(&body)
+        } else {
+            EncKdcRepPart::parse(&el)
+        }
     }
 
     pub fn parse(el: &Element<'_>) -> Result<EncKdcRepPart> {
@@ -499,10 +516,16 @@ impl KrbError {
                     Ok(Some(Ok(b))) => b,
                     _ => continue,
                 };
+                // El valor es la DER de ETYPE-INFO2 ::= SEQUENCE OF
+                // ETYPE-INFO2-ENTRY (RFC 4120 §5.2.7.5): iterar entradas.
                 let mut vr = DerReader::new(&value_bytes);
-                if let Ok(Some(entry_el)) = vr.next() {
-                    if let Ok(e) = EtypeInfo2Entry::parse(&entry_el) {
-                        entries.push(e);
+                if let Ok(Some(info2)) = vr.next() {
+                    if let Ok(mut entries_seq) = info2.parse_seq() {
+                        while let Ok(Some(entry_el)) = entries_seq.next() {
+                            if let Ok(e) = EtypeInfo2Entry::parse(&entry_el) {
+                                entries.push(e);
+                            }
+                        }
                     }
                 }
             }
@@ -531,7 +554,7 @@ impl EtypeInfo2Entry {
     pub fn parse(el: &Element<'_>) -> Result<EtypeInfo2Entry> {
         let mut f = el.parse_seq()?;
         let etype = f.context_child_req(0)?.unwrap_context()?.parse_int_i64()? as i32;
-        let salt = f.context_child(1)?.map(|x| x.unwrap_context().and_then(|i| i.parse_bytes().map(|b| b.to_vec()))).transpose()?;
+        let salt = f.context_child(1)?.map(|x| x.unwrap_context().and_then(|i| i.parse_str_lenient().map(|s2| s2.as_bytes().to_vec()))).transpose()?;
         let s2kparams = f.context_child(2)?.map(|x| x.unwrap_context().and_then(|i| i.parse_bytes().map(|b| b.to_vec()))).transpose()?;
         f.finish()?;
         Ok(EtypeInfo2Entry { etype, salt, s2kparams })
@@ -674,7 +697,13 @@ impl EncTicketPart {
         let mut r = DerReader::new(bytes);
         let el = r.next()?.ok_or(charon_asn1::Asn1Error::TrailingBytes(0))?;
         r.finish()?;
-        let mut f = el.parse_seq()?;
+        // RFC 4120 §5.3: el enc-part del ticket codifica
+        // EncTicketPart ::= [APPLICATION 3]; MIT lo envía envuelto.
+        // Se acepta también la SEQUENCE desnuda.
+        let mut outer = el.content_reader();
+        let body = outer.next_tag(charon_asn1::Tag::SEQUENCE)?;
+        outer.finish()?;
+        let mut f = body.parse_seq()?;
         let flags = f.context_child_req(0)?.unwrap_context()?.parse_flags_u32()?;
         let key = EncryptionKey::parse(&f.context_child_req(1)?.unwrap_context()?)?;
         let crealm = f.context_child_req(2)?.unwrap_context()?.parse_str()?.to_string();

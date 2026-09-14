@@ -173,6 +173,13 @@ pub fn build_pa_enc_timestamp(key: &KerberosKey) -> Result<PaData> {
 }
 
 /// Variante con timestamp arbitrario (sondas de clock-skew de la matriz).
+///
+/// El valor del PA-DATA es la DER de `EncryptedData { etype, cipher }`:
+/// así lo envían los clientes modernos (MIT 1.21 y Windows) y así lo
+/// espera el decodificador del KDC. Enviar el edata crudo "funciona a
+/// veces" contra MIT (hay un fallback) pero es no determinista: el
+/// primer byte aleatorio del edata se interpreta como tag DER y el
+/// resultado del parseo accidental cambia por petición.
 pub fn build_pa_enc_timestamp_at(key: &KerberosKey, when: KrbTime) -> Result<PaData> {
     // pa-enc-ts-enc ::= SEQUENCE { patimestamp [0], pausec [1] opcional }
     let ts = charon_asn1::encode_sequence(&[charon_asn1::encode_context_wrapped(
@@ -180,7 +187,13 @@ pub fn build_pa_enc_timestamp_at(key: &KerberosKey, when: KrbTime) -> Result<PaD
         &charon_asn1::encode_time(when),
     )?])?;
     let edata = charon_kcrypto::encrypt(key, charon_kcrypto::usage::AS_REQ_PA_ENC_TS, &ts)?;
-    Ok(PaData { pa_type: pa_type::PA_ENC_TIMESTAMP, pa_value: edata })
+    let wrapped = EncryptedData {
+        etype: key.etype(),
+        kvno: None,
+        cipher: edata,
+    }
+    .build()?;
+    Ok(PaData { pa_type: pa_type::PA_ENC_TIMESTAMP, pa_value: wrapped })
 }
 
 /// AS-REQ con PA-DATA arbitrario (sondas de la matriz).
@@ -321,24 +334,48 @@ pub fn request_service_ticket(
     etypes: &[i32],
     kdc_options: u32,
 ) -> Result<ServiceTicket> {
-    // AP-REQ con el TGT: authenticator cifrado con la clave de sesión del
-    // TGT (usage 7).
+    // 1) El cuerpo se construye primero: MIT 1.21 (como Windows) exige un
+    // checksum del authenticator sobre el req-body codificado.
+    let body = KdcReqBody {
+        kdc_options,
+        cname: None,
+        realm: tgt.crealm.clone(),
+        sname: Some(PrincipalName::from_spn(spn)),
+        from: None,
+        till: KrbTime::now().plus_secs(3_600),
+        rtime: None,
+        nonce: random_u32().unwrap_or(1),
+        etypes: etypes.to_vec(),
+        addresses: None,
+        enc_authorization_data: None,
+        additional_tickets: None,
+    };
+    let body_tlv = body.build()?;
+
+    // 2) Checksum del authenticator: con clave de sesión del TGT, usage 6
+    // (RFC 4120 §7.5.1), cubre el TLV del req-body. Tipos collision-proof
+    // exigidos por el KDC: HMAC-SHA1-96 AES (15/16) o HMAC-MD5-ARCFOUR (-138),
+    // exactamente lo que produce kcrypto::checksum según el etype.
+    let session_key = charon_kcrypto::KerberosKey::from_raw(tgt.session_key.keytype, &tgt.session_key.keyvalue)?;
+    let cksum_data = charon_kcrypto::checksum(&session_key, charon_kcrypto::usage::TGS_REQ_AUTH_CKSUM, &body_tlv)?;
+    let cksum_type = match tgt.session_key.keytype {
+        charon_kcrypto::etype::RC4_HMAC => -138, // HMAC-MD5-ARCFOUR
+        _ => 16,                                 // HMAC-SHA1-96-AES256 (o 15 con AES128: mismo formato)
+    };
+
+    // 3) Authenticator cifrado con la clave de sesión del TGT (usage 7).
     let now = KrbTime::now();
     let authenticator = Authenticator {
         crealm: tgt.crealm.clone(),
         cname: PrincipalName::user(&tgt.cname),
-        cksum: None,
+        cksum: Some(Checksum { cksumtype: cksum_type, checksum: cksum_data }),
         cusec: 0,
         ctime: now,
         subkey: None,
         seq_number: None,
     };
     let auth_plain = authenticator.build()?;
-    let auth_edata = charon_kcrypto::encrypt(
-        &charon_kcrypto::KerberosKey::from_raw(tgt.session_key.keytype, &tgt.session_key.keyvalue)?,
-        charon_kcrypto::usage::TGS_REQ_AUTH,
-        &auth_plain,
-    )?;
+    let auth_edata = charon_kcrypto::encrypt(&session_key, charon_kcrypto::usage::TGS_REQ_AUTH, &auth_plain)?;
     let ap_req = ApReq {
         ap_options: 0,
         ticket: tgt.ticket.clone(),
@@ -354,20 +391,7 @@ pub fn request_service_ticket(
             pa_type: pa_type::PA_TGS_REQ,
             pa_value: ap_req.build()?,
         }],
-        body: KdcReqBody {
-            kdc_options,
-            cname: None,
-            realm: tgt.crealm.clone(),
-            sname: Some(PrincipalName::from_spn(spn)),
-            from: None,
-            till: KrbTime::now().plus_secs(3_600),
-            rtime: None,
-            nonce: random_u32().unwrap_or(1),
-            etypes: etypes.to_vec(),
-            addresses: None,
-            enc_authorization_data: None,
-            additional_tickets: None,
-        },
+        body,
     };
     let (reply, _transport) = conn.exchange(&req.build()?)?;
     parse_tgs_reply(&reply, &tgt.session_key)

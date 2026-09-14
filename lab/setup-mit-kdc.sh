@@ -128,6 +128,12 @@ create_db_and_principals() {
         echo "[lab] base de datos creada en $KDCSTATE"
     fi
 
+    # krbtgt también necesita clave RC4: la clave de sesión del TGT se
+    # elige entre los etypes pedidos ∩ claves del krbtgt; sin ella, las
+    # peticiones RC4-only fallan con ETYPE_NOSUPP (igual que en AD real
+    # cuando el servicio no tiene la clave).
+    "$KADMIN_LOCAL" -r "$REALM" -q "cpw -keepold -randkey -e arcfour-hmac-md5:normal krbtgt/$REALM" >/dev/null
+
     # kadmin.local opera directamente sobre la BD (no necesita kadmind).
     # Nota: kadmin -q no interpreta comillas; las contraseñas van sin ellas.
     "$KADMIN_LOCAL" -r "$REALM" -q "addprinc -pw Jdoe!Pass42 jdoe" >/dev/null
