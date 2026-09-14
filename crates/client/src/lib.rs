@@ -169,14 +169,47 @@ pub enum Transport {
 /// (usage 1). El valor del PA-DATA es el edata crudo, sin envoltorio
 /// EncryptedData (así lo hacen MIT, Windows, impacket y Rubeus).
 pub fn build_pa_enc_timestamp(key: &KerberosKey) -> Result<PaData> {
-    let now = KrbTime::now();
+    build_pa_enc_timestamp_at(key, KrbTime::now())
+}
+
+/// Variante con timestamp arbitrario (sondas de clock-skew de la matriz).
+pub fn build_pa_enc_timestamp_at(key: &KerberosKey, when: KrbTime) -> Result<PaData> {
     // pa-enc-ts-enc ::= SEQUENCE { patimestamp [0], pausec [1] opcional }
     let ts = charon_asn1::encode_sequence(&[charon_asn1::encode_context_wrapped(
         0,
-        &charon_asn1::encode_time(now),
+        &charon_asn1::encode_time(when),
     )?])?;
     let edata = charon_kcrypto::encrypt(key, charon_kcrypto::usage::AS_REQ_PA_ENC_TS, &ts)?;
     Ok(PaData { pa_type: pa_type::PA_ENC_TIMESTAMP, pa_value: edata })
+}
+
+/// AS-REQ con PA-DATA arbitrario (sondas de la matriz).
+pub fn build_as_req_raw(
+    user: &str,
+    realm: &str,
+    padata: Vec<PaData>,
+    etypes: &[i32],
+    kdc_options: u32,
+) -> Result<KdcReq> {
+    let nonce = random_u32().unwrap_or(1);
+    Ok(KdcReq {
+        msg_type: MSG_AS_REQ,
+        padata,
+        body: KdcReqBody {
+            kdc_options,
+            cname: Some(PrincipalName::user(user)),
+            realm: realm.to_string(),
+            sname: Some(PrincipalName::krbtgt(realm)),
+            from: None,
+            till: KrbTime::now().plus_secs(86_400),
+            rtime: None,
+            nonce,
+            etypes: etypes.to_vec(),
+            addresses: None,
+            enc_authorization_data: None,
+            additional_tickets: None,
+        },
+    })
 }
 
 /// PA-PAC-REQUEST (Microsoft): pide incluir el PAC en el TGT.
@@ -204,25 +237,7 @@ pub fn build_as_req(
     if include_pac {
         padata.push(build_pa_pac_request(true)?);
     }
-    let nonce = random_u32().unwrap_or(1);
-    Ok(KdcReq {
-        msg_type: MSG_AS_REQ,
-        padata,
-        body: KdcReqBody {
-            kdc_options,
-            cname: Some(PrincipalName::user(user)),
-            realm: realm.to_string(),
-            sname: Some(PrincipalName::krbtgt(realm)),
-            from: None,
-            till: KrbTime::now().plus_secs(86_400),
-            rtime: None,
-            nonce,
-            etypes: etypes.to_vec(),
-            addresses: None,
-            enc_authorization_data: None,
-            additional_tickets: None,
-        },
-    })
+    build_as_req_raw(user, realm, padata, etypes, kdc_options)
 }
 
 // ---------- operaciones ----------

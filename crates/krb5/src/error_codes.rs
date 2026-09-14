@@ -67,7 +67,6 @@ pub fn describe(code: i32) -> KdcErrorCode {
         16 => KdcErrorCode { code, name: "KDC_ERR_PADATA_TYPE_NOSUPP", leak: "tipo de PA-DATA no soportado: huella de implementación" },
         18 => KdcErrorCode { code, name: "KDC_ERR_CLIENT_REVOKED", leak: "cuenta deshabilitada/bloqueada (existe)" },
         23 => KdcErrorCode { code, name: "KDC_ERR_KEY_EXPIRED", leak: "contraseña caducada (la cuenta existe)" },
-        24 => KdcErrorCode { code, name: "KDC_ERR_PREAUTH_FAILED", leak: "preauth incorrecto" },
         34 => KdcErrorCode { code, name: "KRB_AP_ERR_REPEAT", leak: "replay: authenticator ya visto (caché de replays)" },
         37 => KdcErrorCode { code, name: "KRB_AP_ERR_SKEW", leak: "reloj desincronizado: revela tolerancia de skew" },
         52 => KdcErrorCode { code, name: "KRB_ERR_RESPONSE_TOO_BIG", leak: "respuesta grande: fuerza TCP (UDP truncado)" },

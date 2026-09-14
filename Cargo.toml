@@ -5,6 +5,9 @@ members = [
     "crates/kcrypto",
     "crates/krb5",
     "crates/client",
+    "crates/attacks",
+    "crates/trace",
+    "crates/matrix",
 ]
 
 [workspace.package]
@@ -18,6 +21,9 @@ charon-asn1 = { path = "crates/asn1" }
 charon-kcrypto = { path = "crates/kcrypto" }
 charon-krb5 = { path = "crates/krb5" }
 charon-client = { path = "crates/client" }
+charon-attacks = { path = "crates/attacks" }
+charon-trace = { path = "crates/trace" }
+charon-matrix = { path = "crates/matrix" }
 
 # Primitivos criptográficos auditados (RustCrypto) — ADR-003 prohíbe
 # reimplementar primitivos; Charon implementa solo las construcciones

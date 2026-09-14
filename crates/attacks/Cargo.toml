@@ -1,0 +1,13 @@
+[package]
+name = "charon-attacks"
+description = "Primitivos ofensivos sobre el stack: enum de usuarios, kerberoast AES-first, AS-REP roast, pass-the-key"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+charon-asn1.workspace = true
+charon-kcrypto.workspace = true
+charon-krb5.workspace = true
+charon-client.workspace = true
+thiserror.workspace = true

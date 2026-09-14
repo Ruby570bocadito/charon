@@ -1,0 +1,14 @@
+[package]
+name = "charon-matrix"
+description = "Matriz de comportamiento KDC: batería de sondas AS/TGS con resultados en JSON (dataset público)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+charon-asn1.workspace = true
+charon-kcrypto.workspace = true
+charon-krb5.workspace = true
+charon-client.workspace = true
+serde.workspace = true
+serde_json.workspace = true
