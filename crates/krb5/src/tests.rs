@@ -2,7 +2,6 @@
 
 use crate::*;
 use charon_asn1::{encode_context_wrapped, encode_sequence};
-use error_codes::*;
 
 fn rt_roundtrip(bytes: &[u8]) {
     // Todo lo que Charon codifica debe poder releerse byte a byte.

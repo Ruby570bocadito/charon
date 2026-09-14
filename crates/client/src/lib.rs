@@ -72,7 +72,8 @@ pub enum AsProbe {
     /// 25: el usuario existe y requiere preauth (regala el salt).
     PreauthRequired { salts: Vec<EtypeInfo2Entry>, raw: Vec<u8> },
     /// AS-REP directo: la cuenta no requiere preauth (AS-REP roasteable).
-    NoPreauth { reply: KdcRep, raw: Vec<u8> },
+    /// `reply` va en Box: KdcRep es grande y AsProbe se devuelve por valor.
+    NoPreauth { reply: Box<KdcRep>, raw: Vec<u8> },
     /// 6: el principal no existe.
     PrincipalUnknown { raw: Vec<u8> },
     /// 24: existe y el preauth (si se envió) era incorrecto.
@@ -261,7 +262,7 @@ pub fn probe_as_no_preauth(conn: &KdcConnection, user: &str, realm: &str, etypes
     let (reply, _transport) = conn.exchange(&req.build()?)?;
     // ¿AS-REP directo? (cuenta sin preauth: roasteable)
     if KdcRep::parse(&reply).is_ok() {
-        return Ok(AsProbe::NoPreauth { reply: KdcRep::parse(&reply)?, raw: reply });
+        return Ok(AsProbe::NoPreauth { reply: Box::new(KdcRep::parse(&reply)?), raw: reply });
     }
     let err = KrbError::parse(&reply)?;
     match err.error_code {

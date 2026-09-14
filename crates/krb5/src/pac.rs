@@ -121,7 +121,7 @@ impl Pac {
         // NameLength es un USHORT en MS-PAC/§Client Info.
         let name_len = u16::from_le_bytes(b.data[8..10].try_into().ok()?) as usize;
         let raw = b.data.get(10..10 + name_len)?;
-        let name: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes(c.try_into().unwrap())).collect();
+        let name: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
         Some((client_id, String::from_utf16_lossy(&name)))
     }
 }
@@ -223,8 +223,8 @@ fn sid_from_bytes(bytes: &[u8]) -> Option<String> {
         return None;
     }
     let mut authority: u64 = 0;
-    for i in 2..8 {
-        authority = (authority << 8) | bytes[i] as u64;
+    for &b in &bytes[2..8] {
+        authority = (authority << 8) | b as u64;
     }
     let mut sid = format!("S{revision}-{authority}");
     for i in 0..count {
@@ -280,7 +280,7 @@ impl LogonInfo {
         let mut cursor = r.pos;
         let mut strings = Vec::with_capacity(deferred.len());
         for &(_, len) in &deferred {
-            if cursor % 4 != 0 {
+            if !cursor.is_multiple_of(4) {
                 cursor += 4 - cursor % 4;
             }
             let mut rr = NdrReader { data, pos: cursor };
@@ -383,16 +383,16 @@ mod tests {
             push32(&mut body, 0x55667788);
         }
         let strings = vec!["jsmith", "John Smith", "", "", "", ""];
-        let mut push_string = |name: &str, body: &mut Vec<u8>, deferred: &mut Vec<u8>| {
+        let push_string = |name: &str, body: &mut Vec<u8>, deferred: &mut Vec<u8>| {
             let chars: Vec<u8> = name.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-            push32(body, chars.len() as u32 | 0); // len (u16) + maxlen (u16)
+            push32(body, chars.len() as u32); // len (u16) + maxlen (u16)
             // len y maxlen como u16 separados:
             body.truncate(body.len() - 4);
             body.extend_from_slice(&(chars.len() as u16).to_le_bytes());
             body.extend_from_slice(&(chars.len() as u16).to_le_bytes());
             push32(body, 0x00020000); // referent
             deferred.extend_from_slice(&chars);
-            while deferred.len() % 4 != 0 {
+            while !deferred.len().is_multiple_of(4) {
                 deferred.push(0);
             }
         };
@@ -453,7 +453,7 @@ mod tests {
         // Buffers alineados a 8: el offset de la firma se calcula tras
         // rellenar el buffer LOGON_INFO.
         let mut blob_padded = blob.clone();
-        while blob_padded.len() % 8 != 0 {
+        while !blob_padded.len().is_multiple_of(8) {
             blob_padded.push(0);
         }
         let sig_off = logon_off + blob_padded.len() as u64;

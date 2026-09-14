@@ -40,6 +40,12 @@ Las herramientas actuales tratan Kerberos como caja negra:
 
 ## Demonstración (salidas reales contra MIT krb5 1.21.3)
 
+![Demonstración de charon: enum, kerberoast y asreproast contra un KDC MIT real](docs/assets/charon-demo.png)
+
+*Captura generada con [`scripts/make_screenshot.py`](scripts/make_screenshot.py) a partir
+de ejecuciones reales; los hashes aparecen recortados (los completos están en
+[`traces/`](traces/) y en el [dataset](dataset/)).*
+
 **Enumeración de usuarios por códigos de error del KDC** (6 = no existe,
 25 = existe con preauth + salt regalado, sin preauth = AS-REP roasteable):
 

@@ -426,30 +426,18 @@ impl KrbError {
         let stime = crate::build_time_field(4, &self.stime)?;
         let susec = ctx_int(5, self.susec as i64);
         let error_code = ctx_int(6, self.error_code as i64);
-        let crealm = match &self.crealm {
-            Some(r) => Some(ctx_str(7, r)),
-            None => None,
-        };
+        let crealm = self.crealm.as_ref().map(|r| ctx_str(7, r));
         let cname = match &self.cname {
             Some(c) => Some(encode_context_wrapped(8, &c.build()?)?),
             None => None,
         };
-        let realm = match &self.realm {
-            Some(r) => Some(ctx_str(9, r)),
-            None => None,
-        };
+        let realm = self.realm.as_ref().map(|r| ctx_str(9, r));
         let sname = match &self.sname {
             Some(s) => Some(encode_context_wrapped(10, &s.build()?)?),
             None => None,
         };
-        let e_text = match &self.e_text {
-            Some(t) => Some(ctx_str(11, t)),
-            None => None,
-        };
-        let e_data = match &self.e_data {
-            Some(d) => Some(ctx_octets(12, d)),
-            None => None,
-        };
+        let e_text = self.e_text.as_ref().map(|t| ctx_str(11, t));
+        let e_data = self.e_data.as_ref().map(|d| ctx_octets(12, d));
         let children: Vec<Vec<u8>> = [
             Some(pvno), Some(msg_type), ctime, cusec, Some(stime), Some(susec), Some(error_code),
             crealm, cname, realm, sname, e_text, e_data,

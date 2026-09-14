@@ -401,6 +401,9 @@ impl<'a> DerReader<'a> {
     }
 
     /// Siguiente TLV o `None` si se agotó el buffer.
+    // No implementa Iterator: devuelve Result<Option<Element>>, semántica
+    // distinta de Iterator::next; el nombre no debe confundir al lector.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Element<'a>>> {
         if self.rest.is_empty() {
             return Ok(None);
@@ -497,9 +500,9 @@ fn parse_header(buf: &[u8]) -> Result<(Tag, usize, usize)> {
     // Longitud
     let lb = *buf.get(pos).ok_or(Asn1Error::Truncated { needed: pos + 1, available: buf.len() })?;
     pos += 1;
-    let content_len;
-    if lb < 0x80 {
-        content_len = lb as usize;
+    
+    let content_len = if lb < 0x80 {
+        lb as usize
     } else if lb == 0x80 {
         return Err(Asn1Error::IndefiniteLength);
     } else {
@@ -523,8 +526,8 @@ fn parse_header(buf: &[u8]) -> Result<(Tag, usize, usize)> {
         if (acc >> ((nbytes - 1) * 8)) == 0 {
             return Err(Asn1Error::BadLengthForm { nbytes });
         }
-        content_len = acc;
-    }
+        acc
+    };
     Ok((Tag { class, constructed, number }, content_len, pos))
 }
 
