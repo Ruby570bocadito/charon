@@ -36,3 +36,15 @@ AS-REP
     sname = krbtgt/LAB.LOCAL
        ⟶ servicio
 
+       ⟶ eco del nonce del AS-REQ (antirreplay)
+    flags = 0x00610000
+       ⟶ bit 9=initial (es un TGT nuevo), 10=pre-authent, 1=forwardable, 13=ok-as-delegate
+    authtime = 20260914214830Z
+       ⟶ cuándo se autenticó el usuario
+    endtime = 20260915214830Z
+       ⟶ caducidad del ticket
+    srealm = LAB.LOCAL
+       ⟶ dominio del servicio
+    sname = krbtgt/LAB.LOCAL
+       ⟶ servicio
+

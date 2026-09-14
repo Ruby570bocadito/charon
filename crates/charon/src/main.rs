@@ -157,6 +157,27 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// S4U2Self (MS-SFU): ticket para un usuario "en nombre de" otro,
+    /// presentando el TGT del servicio. Útil para ver el PAC delegado.
+    S4u2self {
+        /// El servicio que pide (dueño del TGT).
+        #[arg(short, long)]
+        user: String,
+        #[arg(short, long, env = "CHARON_PASSWORD", hide_env_values = true)]
+        password: String,
+        /// Salt AES del servicio.
+        #[arg(long)]
+        salt: Option<String>,
+        /// Usuario a suplantar.
+        #[arg(short, long)]
+        impersonate: String,
+        #[arg(short, long)]
+        realm: String,
+        #[arg(long, default_value = "127.0.0.1")]
+        dc: String,
+        #[arg(long, default_value_t = 88)]
+        port: u16,
+    },
     /// Ejecuta la matriz de comportamiento KDC y escribe el dataset JSON.
     Matrix {
         #[arg(short, long)]
@@ -421,6 +442,36 @@ fn run(cli: Cli) -> Result<(), String> {
                 println!("{}", serde_json::to_string_pretty(&node).map_err(|e| e.to_string())?);
             } else {
                 println!("{}", charon_trace::render_text(&node));
+            }
+            Ok(())
+        }
+
+        Command::S4u2self { user, password, salt, impersonate, realm, dc, port } => {
+            let c = conn(&dc, port);
+            let salt = match salt {
+                Some(s) => s,
+                None => learn_salt(&c, &user, &realm)?,
+            };
+            let key = key_from_credentials(&user, &realm, &salt, &password, None, None)?;
+            let tgt = charon_client::request_tgt(&c, &user, &realm, &key, &[etype_mod::AES256_CTS_HMAC_SHA1_96], 0)
+                .map_err(|e| format!("no se pudo obtener el TGT: {e}"))?;
+            let st = charon_client::s4u2self(&c, &tgt, &user, &impersonate, &realm)
+                .map_err(|e| format!("S4U2Self rechazado: {e}"))?;
+            println!(
+                "{} ticket para {} en nombre de {} (etype {})",
+                "s4u2self:".bold(),
+                st.ticket.sname.flat().cyan(),
+                impersonate.yellow(),
+                st.ticket.enc_part.etype
+            );
+            // El ticket va cifrado con la clave larga del servicio: al
+            // descifrarlo, el PAC muestra la identidad suplantada.
+            match charon_krb5::pac::extract_pac(&st.ticket, &key) {
+                Ok(pac) => match pac.client_info() {
+                    Some((_, name)) => println!("  PAC CLIENT INFO: {}", name.green()),
+                    None => println!("  PAC buffers: {:?}", pac.buffers.iter().map(|b| b.buffer_type).collect::<Vec<_>>()),
+                },
+                Err(e) => println!("  PAC: {e}"),
             }
             Ok(())
         }

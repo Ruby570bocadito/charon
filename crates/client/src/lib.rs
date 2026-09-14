@@ -286,11 +286,11 @@ pub fn request_tgt(
 ) -> Result<Tgt> {
     let req = build_as_req(user, realm, Some(key), etypes, true, kdc_options)?;
     let (reply, _transport) = conn.exchange(&req.build()?)?;
-    parse_as_reply(&reply, user, realm, key)
+    parse_as_reply(&reply, user, key)
 }
 
 /// Parsea y descifra un AS-REP (o traduce el KRB-ERROR a error de cliente).
-pub fn parse_as_reply(reply: &[u8], user: &str, realm: &str, key: &KerberosKey) -> Result<Tgt> {
+pub fn parse_as_reply(reply: &[u8], user: &str, key: &KerberosKey) -> Result<Tgt> {
     if let Ok(err) = KrbError::parse(reply) {
         let d = error_codes::describe(err.error_code);
         return Err(ClientError::Krb5(Krb5Error::BadReply(format!(

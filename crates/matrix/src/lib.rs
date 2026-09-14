@@ -10,7 +10,7 @@
 //! diseñado para que el experimento sea público y repetible.
 
 use charon_asn1::KrbTime;
-use charon_client::{ClientError, KdcConnection, Result};
+use charon_client::{ClientError, KdcConnection};
 use charon_kcrypto::KerberosKey;
 use charon_krb5::*;
 

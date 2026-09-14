@@ -36,27 +36,31 @@ fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
 }
 
 fn aes_ecb_encrypt_block(key: &[u8], block: &[u8; AES_BLOCK]) -> [u8; AES_BLOCK] {
-    let mut out = *block;
     if key.len() == 16 {
         let c = aes::Aes128::new_from_slice(key).expect("clave AES-128 de 16 bytes");
-        c.encrypt_block(cipher::Block::<aes::Aes128>::from_mut_slice(&mut out));
+        let mut out: cipher::Block<aes::Aes128> = (*block).into();
+        c.encrypt_block(&mut out);
+        out.into()
     } else {
         let c = aes::Aes256::new_from_slice(key).expect("clave AES-256 de 32 bytes");
-        c.encrypt_block(cipher::Block::<aes::Aes256>::from_mut_slice(&mut out));
+        let mut out: cipher::Block<aes::Aes256> = (*block).into();
+        c.encrypt_block(&mut out);
+        out.into()
     }
-    out
 }
 
 fn aes_ecb_decrypt_block(key: &[u8], block: &[u8; AES_BLOCK]) -> [u8; AES_BLOCK] {
-    let mut out = *block;
     if key.len() == 16 {
         let c = aes::Aes128::new_from_slice(key).expect("clave AES-128 de 16 bytes");
-        c.decrypt_block(cipher::Block::<aes::Aes128>::from_mut_slice(&mut out));
+        let mut out: cipher::Block<aes::Aes128> = (*block).into();
+        c.decrypt_block(&mut out);
+        out.into()
     } else {
         let c = aes::Aes256::new_from_slice(key).expect("clave AES-256 de 32 bytes");
-        c.decrypt_block(cipher::Block::<aes::Aes256>::from_mut_slice(&mut out));
+        let mut out: cipher::Block<aes::Aes256> = (*block).into();
+        c.decrypt_block(&mut out);
+        out.into()
     }
-    out
 }
 
 /// DK/DR de RFC 3961 §5.1: n-fold de la constante a un bloque y cifrado

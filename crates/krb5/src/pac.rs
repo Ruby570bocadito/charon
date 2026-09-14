@@ -266,7 +266,6 @@ impl LogonInfo {
         r.push_string(&mut deferred)?;
         r.push_string(&mut deferred)?;
         // PISID LogonDomainId (referent diferido).
-        let sid_refid_pos = r.pos;
         let _sid_refid = r.u32le()?;
         // Reserved1[2], UserAccountControl, SubAuthStatus.
         r.pos += 8;
@@ -313,7 +312,6 @@ impl LogonInfo {
             let count = bytes.get(1).copied().unwrap_or(0) as usize;
             let end = cursor + 8 + count * 4;
             let sid = sid_from_bytes(data.get(cursor..end.min(data.len())).unwrap_or(&[]));
-            r.pos = end;
             sid
         } else {
             None
