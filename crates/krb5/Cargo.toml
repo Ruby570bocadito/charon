@@ -1,0 +1,12 @@
+[package]
+name = "charon-krb5"
+description = "Tipos, builders y parsers de mensajes Kerberos (RFC 4120, MS-SFU, MS-PAC)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+charon-asn1.workspace = true
+charon-kcrypto.workspace = true
+thiserror.workspace = true
+getrandom.workspace = true

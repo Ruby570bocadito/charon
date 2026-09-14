@@ -20,7 +20,7 @@
 use crate::error::{CryptoError, Result};
 use crate::nfold::nfold;
 use cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
-use digest::{KeyInit as _, Mac as _};
+use digest::Mac as _;
 use hmac::Hmac;
 use sha1::Sha1;
 

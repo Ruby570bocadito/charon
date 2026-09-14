@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/asn1",
     "crates/kcrypto",
+    "crates/krb5",
 ]
 
 [workspace.package]
@@ -13,6 +14,8 @@ license = "MIT"
 [workspace.dependencies]
 # Crates internos del workspace
 charon-asn1 = { path = "crates/asn1" }
+charon-kcrypto = { path = "crates/kcrypto" }
+charon-krb5 = { path = "crates/krb5" }
 
 # Primitivos criptográficos auditados (RustCrypto) — ADR-003 prohíbe
 # reimplementar primitivos; Charon implementa solo las construcciones

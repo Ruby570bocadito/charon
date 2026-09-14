@@ -22,9 +22,6 @@ pub mod rc4hmac;
 
 pub use error::{CryptoError, Result};
 
-use hmac::{Hmac, Mac};
-use md5::Md5;
-
 /// Tipos de cifrado (etypes) soportados, con sus números IANA.
 pub mod etype {
     pub const AES128_CTS_HMAC_SHA1_96: i32 = 17;

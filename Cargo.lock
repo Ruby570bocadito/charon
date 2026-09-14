@@ -55,6 +55,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "charon-krb5"
+version = "0.1.0"
+dependencies = [
+ "charon-asn1",
+ "charon-kcrypto",
+ "getrandom",
+ "thiserror",
+]
+
+[[package]]
 name = "cipher"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
