@@ -118,7 +118,25 @@ impl KdcConnection {
 
     /// Envía por TCP con el framing de RFC 4120 §7.2.2.
     pub fn send_tcp(&self, req: &[u8]) -> Result<Vec<u8>> {
-        let mut stream = TcpStream::connect((self.host.as_str(), self.port))?;
+        // connect acotado por el timeout de la conexión: sin esto, el
+        // SYN de un KDC caído deja el hilo colgado segundos (o minutos,
+        // según el SO) en el connect por defecto.
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<_> = (self.host.as_str(), self.port).to_socket_addrs()?.collect();
+        let mut last_err: Option<std::io::Error> = None;
+        let mut stream = None;
+        for addr in &addrs {
+            match TcpStream::connect_timeout(addr, self.timeout) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let mut stream = stream.ok_or(ClientError::Io(last_err.unwrap_or_else(|| {
+            std::io::Error::other("sin direcciones para el KDC")
+        })))?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
         let len = (req.len() as u32).to_be_bytes();

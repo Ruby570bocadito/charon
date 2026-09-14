@@ -39,6 +39,7 @@ rc4 = "0.2"
 pbkdf2 = "0.13"
 cipher = "0.5"
 digest = "0.11"
+zeroize = "1"
 
 # Utilidades
 getrandom = "0.4"

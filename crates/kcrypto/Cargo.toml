@@ -17,6 +17,7 @@ rc4.workspace = true
 pbkdf2.workspace = true
 cipher.workspace = true
 digest.workspace = true
+zeroize.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 thiserror.workspace = true

@@ -80,6 +80,19 @@ impl KerberosKey {
         }
     }
 
+    /// Pone a cero el material de clave al soltarlo (las claves de largo
+    /// plazo y de sesión son secretos: no deben quedar en memoria
+    /// liberada esperando a un dump). `Clone` crea copias independientes
+    /// que también pasan por aquí, así que cada duplicado se limpia.
+    fn zeroize_now(&mut self) {
+        use zeroize::Zeroize;
+        match self {
+            KerberosKey::Rc4(b) => b.zeroize(),
+            KerberosKey::Aes128(b) => b.zeroize(),
+            KerberosKey::Aes256(b) => b.zeroize(),
+        }
+    }
+
     /// Deriva la clave de una contraseña. RC4 = MD4(UTF-16LE(password)),
     /// el NT hash (conversión aplicada aquí). AES = string-to-key de
     /// RFC 3962 con la contraseña en sus bytes crudos (el RFC 3962 no
@@ -116,6 +129,12 @@ impl KerberosKey {
             (etype::AES256_CTS_HMAC_SHA1_96, n) => Err(CryptoError::BadKeyLength { etype, len: n }),
             (e, _) => Err(CryptoError::UnsupportedEtype(e)),
         }
+    }
+}
+
+impl Drop for KerberosKey {
+    fn drop(&mut self) {
+        self.zeroize_now();
     }
 }
 
