@@ -55,7 +55,7 @@ fn openssl_parses_charon_output() {
     let krb_error = encode_tlv(Tag::application(30, true), &body).unwrap();
     let text = cross_parse("krb-error", &krb_error);
     assert!(text.contains("SEQUENCE"), "falta SEQUENCE en openssl:\n{text}");
-    assert!(text.contains("[4]"), "falta stime [4] en openssl:\n{text}");
+    assert!(text.contains("cont [ 4 ]"), "falta stime [4] en openssl:\n{text}");
     assert!(
         text.contains("GENERALIZEDTIME") || text.contains("Genera"),
         "falta el tiempo en openssl:\n{text}"
