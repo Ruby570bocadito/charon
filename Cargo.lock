@@ -93,6 +93,7 @@ dependencies = [
  "hex",
  "owo-colors",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

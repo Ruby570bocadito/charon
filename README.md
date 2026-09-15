@@ -34,8 +34,12 @@ Las herramientas actuales tratan Kerberos como caja negra:
   real, builders/parsers de AS/TGS/AP/KRB-ERROR/PAC.
 - **Primitivos ofensivos (M2)**: enumeración de usuarios, kerberoasting
   **AES-first** (sin downgrade → sin evento 4769 con 0x17), AS-REP roasting,
-  pass-the-key, S4U2Self y **renovación de TGT** (RFC 4120 §3.3.3), con
-  control total de etypes, PA-DATA y flags.
+  pass-the-key, S4U2Self, **S4U2Proxy** (MS-SFU §2.2.3, primitivo de RBCD) y
+  **renovación de TGT** (RFC 4120 §3.3.3), con control total de etypes,
+  PA-DATA y flags.
+- **Persistencia de material (M2b)**: escritura/lectura del formato ccache
+  FILE v4 de MIT (verificado contra klist/kinit reales) — guarda el TGT y
+  renueva sin recredencializar.
 - **Trace (M3)**: cada mensaje decodificado campo a campo, con explicación
   en español y referencia al RFC — texto coloreado o JSON.
 - **Matriz KDC (M4)**: batería de sondas válidas, casi válidas y
@@ -149,8 +153,21 @@ charon spray --pairs pares.txt -r LAB.LOCAL --dc 10.0.0.1
 charon as --user jdoe -r LAB.LOCAL --renewable          # pedirlo renovable
 charon renew --user jdoe -r LAB.LOCAL --renew-hours 168  # renovarlo por el cable
 
+# Persistencia tipo ccache (formato FILE v4 de MIT, interoperable):
+# guarda el TGT y renovar SIN recredencializar (equivalente a kinit -R -c);
+# el fichero se escribe 0600 y lo leen klist/kinit reales
+charon as --user jdoe -r LAB.LOCAL --renewable --ccache jdoe.ccache
+charon renew --ccache jdoe.ccache                        # sin usuario ni contraseña
+
 # S4U2Self: ticket en nombre de otro usuario (para ver el PAC delegado)
 charon s4u2self --user jdoe --impersonate aesuser -r LAB.LOCAL --dc 10.0.0.1
+
+# S4U2Proxy (primitivo de RBCD): evidence ticket de S4U2Self + additional-tickets
+# y opción C_NAME_IN_ADDL_TKT. El servicio delegador necesita
+# ok_to_auth_as_delegate (scripts/lab_setup_delegation.sh). Contra el KDC MIT con
+# backend db2 la petición es correcta pero la política del KDB la deniega
+# (solo los KDB LDAP/test autorizan delegación) — el CLI lo diagnostica
+charon s4u2proxy --user svc-api --impersonate jdoe --to svc-db -r LAB.LOCAL
 
 # Trace de cualquier mensaje capturado (DER crudo)
 charon decode --file as-rep.bin -r LAB.LOCAL --user jdoe
@@ -179,6 +196,7 @@ reino `LAB.LOCAL` y usuarios diseñados para cada primitivo:
 | `mssql/srv01.lab.local` | cuenta de servicio (kerberoast) | AES256 + RC4 |
 | `legacy` | cuenta RC4-only (kerberoast RC4) | RC4 |
 | `nopreauth` | DONT_REQUIRE_PREAUTH (AS-REP roast) | AES256 + RC4 |
+| `svc-api` / `svc-db` | delegación S4U (S4U2Self/S4U2Proxy) | AES256 + AES128 |
 
 ```bash
 bash lab/setup-mit-kdc.sh          # compila, configura, arranca y verifica
@@ -197,13 +215,14 @@ charon/
 ├── crates/                  # workspace Rust — un crate por módulo
 │   ├── asn1/                # codec DER propio (ADR-001) + cross-check openssl
 │   ├── kcrypto/             # crypto RFC: n-fold, DK, CTS, RC4-HMAC, AES (ADR-003)
-│   ├── krb5/                # mensajes AS/TGS/AP/KRB-ERROR + PAC (MS-PAC)
-│   ├── client/              # transporte UDP/TCP:88, sesión KDC, S4U2Self, renovación TGT
+│   ├── krb5/                # mensajes AS/TGS/AP/KRB-ERROR + PAC (MS-PAC) + ccache FILE v4
+│   ├── client/              # transporte UDP/TCP:88, sesión KDC, S4U2Self/S4U2Proxy, renovación TGT, ccache
 │   ├── attacks/             # enum, kerberoast, asreproast, pass-the-key, spray + hashcat
 │   ├── trace/               # decodificación campo a campo (texto/JSON)
 │   ├── matrix/              # runner de la matriz KDC → dataset JSON
 │   └── charon/              # el binario CLI
 ├── lab/                     # KDC MIT krb5 real sin root (setup + usuarios)
+├── scripts/                 # setup de delegación del lab, captura del README
 ├── dataset/                 # resultados reales de la matriz (publicables)
 ├── docs/
 │   ├── adr/                 # ADR-001 codec propio, ADR-002 Rust, ADR-003 crypto

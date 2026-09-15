@@ -16,6 +16,8 @@ use charon_kcrypto::random_u32;
 use charon_kcrypto::KerberosKey;
 use charon_krb5::*;
 
+pub mod ccache;
+
 pub type Result<T> = std::result::Result<T, ClientError>;
 
 #[derive(thiserror::Error, Debug)]
@@ -638,4 +640,60 @@ pub fn s4u2self(
     };
     let (reply, _transport) = conn.exchange(&req.build()?)?;
     parse_tgs_reply(&reply, &tgt.session_key)
+}
+
+// ---------- S4U2Proxy (MS-SFU §2.2.3) ----------
+
+/// S4U2Proxy — la mitad de la delegación que completa el cuadro con
+/// S4U2Self, y el primitivo de RBCD: el servicio presenta su TGT
+/// (PA-TGS-REQ) y el **evidence ticket** de S4U2Self — un ticket del
+/// usuario suplantado hacia el propio servicio con el flag FORWARDABLE,
+/// que MIT solo emite si el servicio tiene `ok_to_auth_as_delegate` —
+/// en `additional-tickets` (RFC 4120 §5.4.1 campo [11]), y pide un ticket
+/// del usuario suplantado hacia `target_spn`.
+///
+/// Opciones: `C_NAME_IN_ADDITIONAL_TICKET` (el cname del req-body
+/// describe al usuario del additional-ticket, MS-SFU §2.2.3) +
+/// `FORWARDABLE` + `CANONICALIZE`. El enc-part del TGS-REP va cifrado con
+/// la clave de sesión del TGT del servicio (usage 8).
+///
+/// La prueba de la delegación: el ticket devuelto tiene de cliente al
+/// usuario suplantado y va cifrado con la clave larga del servicio
+/// DESTINO — con ella `pac::extract_pac` muestra el PAC del usuario, sin
+/// que el usuario haya intervenido en absoluto.
+pub fn s4u2proxy(
+    conn: &KdcConnection,
+    service_tgt: &Tgt,
+    evidence: &Ticket,
+    target_spn: &str,
+    impersonated: &str,
+    realm: &str,
+    etypes: &[i32],
+) -> Result<ServiceTicket> {
+    let session_key =
+        charon_kcrypto::KerberosKey::from_raw(service_tgt.session_key.keytype, &service_tgt.session_key.keyvalue)?;
+    let body = KdcReqBody {
+        kdc_options: kdc_options::FORWARDABLE
+            | kdc_options::CANONICALIZE
+            | kdc_options::C_NAME_IN_ADDITIONAL_TICKET,
+        cname: Some(PrincipalName::user(impersonated)),
+        realm: realm.to_string(),
+        sname: Some(PrincipalName::from_spn(target_spn)),
+        from: None,
+        till: KrbTime::now().plus_secs(600),
+        rtime: None,
+        nonce: random_u32().unwrap_or(1),
+        etypes: etypes.to_vec(),
+        addresses: None,
+        enc_authorization_data: None,
+        additional_tickets: Some(vec![evidence.clone()]),
+    };
+    let body_tlv = body.build()?;
+    let req = KdcReq {
+        msg_type: MSG_TGS_REQ,
+        padata: vec![build_pa_tgs_req(service_tgt, &session_key, &body_tlv)?],
+        body,
+    };
+    let (reply, _transport) = conn.exchange(&req.build()?)?;
+    parse_tgs_reply(&reply, &service_tgt.session_key)
 }

@@ -184,18 +184,23 @@ enum Command {
         /// el KDC recorta a su max_renewable_life): lo que `kinit -r`.
         #[arg(long)]
         renewable: bool,
+        /// Guarda el TGT en un ccache FILE v4 de MIT (0600): luego
+        /// `charon renew --ccache` renueva SIN volver a credencializar.
+        /// klist/kinit de MIT leen el fichero (interoperabilidad real).
+        #[arg(long)]
+        ccache: Option<String>,
         #[arg(long, default_value = "127.0.0.1")]
         dc: String,
         #[arg(long, default_value_t = 88)]
         port: u16,
     },
-    /// Renovación de TGT (RFC 4120 §3.3.3): pide un TGT renovable y lo
-    /// renueva por el cable (TGS-REQ con flag RENEW y el TGT como
-    /// ticket de cabecera). La renovación conserva la authtime y
-    /// extiende el endtime dentro del renew-till concedido.
+    /// Renovación de TGT (RFC 4120 §3.3.3). Dos caminos: con credenciales
+    /// (--user/--realm) obtiene un TGT renovable y lo renueva; con
+    /// --ccache renueva el TGT persistido SIN recredencializar (y lo
+    /// reescribe renovado en el mismo fichero).
     Renew {
         #[arg(short, long)]
-        user: String,
+        user: Option<String>,
         /// Contraseña (o --password-stdin; env: CHARON_PASSWORD).
         #[arg(short, long, env = "CHARON_PASSWORD", hide_env_values = true)]
         password: Option<String>,
@@ -203,7 +208,7 @@ enum Command {
         #[arg(long)]
         password_stdin: bool,
         #[arg(short, long)]
-        realm: String,
+        realm: Option<String>,
         /// Salt AES (por defecto lo aprende del error 25).
         #[arg(long)]
         salt: Option<String>,
@@ -211,6 +216,11 @@ enum Command {
         /// max_renewable_life; el lab: 7 días = 168 h).
         #[arg(long, default_value_t = 168)]
         renew_hours: u64,
+        /// Renueva el TGT guardado en este ccache FILE v4 (de
+        /// `charon as --ccache`): sin usuario ni contraseña, como
+        /// `kinit -R -c`. El fichero se reescribe con el TGT renovado.
+        #[arg(long)]
+        ccache: Option<String>,
         #[arg(long, default_value = "127.0.0.1")]
         dc: String,
         #[arg(long, default_value_t = 88)]
@@ -257,6 +267,39 @@ enum Command {
         /// Usuario a suplantar.
         #[arg(short, long)]
         impersonate: String,
+        #[arg(short, long)]
+        realm: String,
+        #[arg(long, default_value = "127.0.0.1")]
+        dc: String,
+        #[arg(long, default_value_t = 88)]
+        port: u16,
+    },
+    /// S4U2Proxy (MS-SFU §2.2.3, primitivo de RBCD): con el TGT del
+    /// servicio y el evidence ticket de S4U2Self, pide un ticket del
+    /// usuario suplantado hacia OTRO servicio. Si --to-password está
+    /// presente, descifra el ticket final con la clave del servicio
+    /// destino y muestra el PAC del usuario suplantado (la prueba de la
+    /// delegación). El servicio que delega necesita el atributo
+    /// ok_to_auth_as_delegate en el KDC (ver scripts/lab_setup_delegation.sh).
+    S4u2proxy {
+        /// El servicio que delega (dueño del TGT y del evidence ticket).
+        #[arg(short, long)]
+        user: String,
+        #[arg(short, long, env = "CHARON_PASSWORD", hide_env_values = true)]
+        password: String,
+        /// Salt AES del servicio que delega.
+        #[arg(long)]
+        salt: Option<String>,
+        /// Usuario a suplantar.
+        #[arg(short, long)]
+        impersonate: String,
+        /// SPN del servicio destino del ticket delegado.
+        #[arg(long)]
+        to: String,
+        /// Contraseña del servicio destino: permite descifrar el ticket
+        /// final y demostrar el PAC del usuario suplantado.
+        #[arg(long)]
+        to_password: Option<String>,
         #[arg(short, long)]
         realm: String,
         #[arg(long, default_value = "127.0.0.1")]
@@ -452,7 +495,11 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Spray { users, pairs, password, password_stdin, realm, dc, port, delay_ms, json, output } => {
             // En modo pares cada usuario lleva SU contraseña; el modo
             // clásico (una contraseña contra la lista) queda intacto.
-            let targets: Vec<(String, String)> = if let Some(path) = &pairs {
+            // El contenedor SprayPairs hace zeroize de las contraseñas al
+            // soltarlas (patrón de KerberosKey en kcrypto, pendiente desde
+            // la Ronda 2): los secretos del fichero de pares no quedan en
+            // memoria muerta después del comando.
+            let targets = SprayPairs(if let Some(path) = &pairs {
                 if !users.is_empty() || password.is_some() || password_stdin {
                     return fail(
                         "--pairs no es compatible con --users/--password/--password-stdin: en modo pares cada usuario lleva su propia contraseña".into(),
@@ -466,7 +513,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 }
                 let password = resolve_password(password, password_stdin)?;
                 list.into_iter().map(|u| (u, password.clone())).collect()
-            };
+            });
             if targets.is_empty() {
                 return fail("no hay objetivos de spray".into());
             }
@@ -557,7 +604,7 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
 
-        Command::As { user, password, password_stdin, realm, salt, etype, renewable, dc, port } => {
+        Command::As { user, password, password_stdin, realm, salt, etype, renewable, ccache, dc, port } => {
             let c = conn(&dc, port);
             let password = resolve_password(password, password_stdin)?;
             let salt = match salt {
@@ -587,13 +634,91 @@ fn run(cli: Cli) -> Result<(), String> {
                 tgt.endtime,
                 renew_note
             );
+            if let Some(path) = &ccache {
+                charon_client::ccache::save_tgt(path, &tgt)
+                    .map_err(|e| format!("no pude escribir el ccache {path}: {e}"))?;
+                println!(
+                    "{} TGT guardado en {} (0600): renovable sin contraseña con `charon renew --ccache {path}`",
+                    "ccache:".bold(),
+                    path.yellow()
+                );
+            }
             let node = charon_trace::trace_kdc_rep(&tgt.raw_reply, Some(&key)).map_err(|e| e.to_string())?;
             println!("\n{}", charon_trace::render_text(&node));
             Ok(())
         }
 
-        Command::Renew { user, password, password_stdin, realm, salt, renew_hours, dc, port, trace } => {
+        Command::Renew { user, password, password_stdin, realm, salt, renew_hours, ccache, dc, port, trace } => {
             let c = conn(&dc, port);
+            // Dos caminos exclusivos: ccache (sin credenciales) o AS completo.
+            if let Some(path) = &ccache {
+                if user.is_some() || salt.is_some() || realm.is_some() || password_stdin {
+                    return fail(
+                        "--ccache es incompatible con --user/--realm/--salt/--password-stdin: \
+                         el TGT persistido ya trae su identidad"
+                            .into(),
+                    );
+                }
+                if password.is_some() {
+                    return fail(
+                        "--ccache es incompatible con --password: renovar SIN recredencializar \
+                         es justo el punto (usa `charon as --ccache` para crear el fichero)"
+                            .into(),
+                    );
+                }
+                let tgt = charon_client::ccache::load_tgt(path)
+                    .map_err(|e| format!("ccache {path}: {e}"))?;
+                if tgt.flags & charon_krb5::ticket_flags::RENEWABLE == 0 {
+                    return fail(format!(
+                        "el TGT de {path} no lleva el flag RENEWABLE: crealo con `charon as --renewable --ccache`"
+                    ));
+                }
+                println!(
+                    "{} cargado {}@{} → caduca {}, renovable hasta {}",
+                    "renew:".bold(),
+                    format!("{}/{}", tgt.crealm, tgt.cname).cyan(),
+                    tgt.ticket.sname.flat(),
+                    tgt.endtime.to_string().yellow(),
+                    tgt.renew_till.map(|t| t.to_string()).unwrap_or_default()
+                );
+                // Mismo acote que el camino con credenciales: saturar antes
+                // del cast para que el till nunca salga negativo.
+                let till = charon_asn1::KrbTime::now().plus_secs(
+                    renew_hours.saturating_mul(3_600).min(i64::MAX as u64) as i64,
+                );
+                let renewed = charon_client::renew_tgt(&c, &tgt, till)
+                    .map_err(|e| format!("renovación rechazada por el KDC: {e}"))?;
+                println!(
+                    "{} renovado → caduca {} (authtime conservada: {}, nueva clave de sesión etype {})",
+                    "  ↳".green(),
+                    renewed.endtime.to_string().yellow(),
+                    renewed.authtime,
+                    renewed.session_key.keytype
+                );
+                // Reescribe el fichero con el TGT renovado (lo que hace
+                // `kinit -R -c`): la próxima renovación parte del nuevo.
+                charon_client::ccache::save_tgt(path, &renewed)
+                    .map_err(|e| format!("no pude actualizar el ccache {path}: {e}"))?;
+                println!(
+                    "{} fichero actualizado con el TGT renovado",
+                    "ccache:".bold()
+                );
+                if trace {
+                    let sess = KerberosKey::from_raw(tgt.session_key.keytype, &tgt.session_key.keyvalue)
+                        .map_err(|e| e.to_string())?;
+                    let node =
+                        charon_trace::trace_kdc_rep(&renewed.raw_reply, Some(&sess)).map_err(|e| e.to_string())?;
+                    println!("\n{}", charon_trace::render_text(&node));
+                }
+                return Ok(());
+            }
+            // Camino clásico: credenciales → TGT renovable → renovación.
+            let user = user.ok_or_else(|| {
+                "falta --user/--realm (o usa --ccache para renovar un TGT persistido)".to_string()
+            })?;
+            let realm = realm.ok_or_else(|| {
+                "falta --realm (o usa --ccache para renovar un TGT persistido)".to_string()
+            })?;
             let password = resolve_password(password, password_stdin)?;
             let salt = match salt {
                 Some(s) => s,
@@ -714,6 +839,117 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
 
+        Command::S4u2proxy { user, password, salt, impersonate, to, to_password, realm, dc, port } => {
+            let c = conn(&dc, port);
+            let salt = match salt {
+                Some(s) => s,
+                None => learn_salt(&c, &user, &realm)?,
+            };
+            let key = key_from_credentials(&user, &realm, &salt, &password, None, None)?;
+            // 1) TGT del servicio que delega. Lección del lab verificada
+            // contra kdc_util.c de MIT 1.21 (get_ticket_flags, líneas
+            // 843-844): MIT recorta FORWARDABLE del ticket emitido si el
+            // TGT cabecera no lo lleva — las opciones del TGS-REQ no
+            // pueden AÑADIR el flag, solo heredarse. Por eso el TGT del
+            // servicio se pide FORWARDABLE (lo que kinit hace por
+            // defecto con forwardable=true).
+            let tgt = charon_client::request_tgt(
+                &c,
+                &user,
+                &realm,
+                &key,
+                &[etype_mod::AES256_CTS_HMAC_SHA1_96],
+                charon_krb5::kdc_options::FORWARDABLE,
+            )
+            .map_err(|e| format!("no se pudo obtener el TGT de {user}: {e}"))?;
+            // 2) Evidence ticket: S4U2Self del usuario suplantado. MIT solo
+            // lo emite FORWARDABLE si el servicio tiene ok_to_auth_as_delegate.
+            let evidence = charon_client::s4u2self(&c, &tgt, &user, &impersonate, &realm)
+                .map_err(|e| format!("S4U2Self rechazado: {e}"))?;
+            let forwardable = evidence.flags & charon_krb5::ticket_flags::FORWARDABLE != 0;
+            println!(
+                "{} evidence ticket {} → {} (etype {}, forwardable: {})",
+                "s4u2self:".bold(),
+                evidence.ticket.sname.flat().cyan(),
+                impersonate.yellow(),
+                evidence.ticket.enc_part.etype,
+                if forwardable {
+                    "sí".green().to_string()
+                } else {
+                    "NO".red().to_string()
+                }
+            );
+            if !forwardable {
+                return fail(format!(
+                    "el evidence ticket NO es forwardable: el KDC no concedió la delegación. \
+                     ¿Tiene {user} el atributo ok_to_auth_as_delegate? (scripts/lab_setup_delegation.sh)"
+                ));
+            }
+            // 3) S4U2Proxy: ticket del usuario hacia el servicio destino.
+            let final_st = match charon_client::s4u2proxy(
+                &c,
+                &tgt,
+                &evidence.ticket,
+                &to,
+                &impersonate,
+                &realm,
+                &[etype_mod::AES256_CTS_HMAC_SHA1_96, etype_mod::RC4_HMAC],
+            ) {
+                Ok(st) => st,
+                Err(charon_client::ClientError::Krb5(charon_krb5::Krb5Error::BadReply(msg)))
+                    if msg.contains("KDC_ERR_BADOPTION") =>
+                {
+                    return fail(format!(
+                        "S4U2Proxy rechazado con KDC_ERR_BADOPTION. Diagnóstico: \
+                         MIT con backend db2 NO puede autorizar ninguna delegación \
+                         (la política vive en el KDB: solo LDAP o el módulo test de \
+                         MIT implementan allowed_to_delegate — ver informe de ronda y \
+                         docs/threat-model.md). La petición S4U2Proxy de Charon es \
+                         correcta: el KDC la reconoció y la llevó a evaluación de \
+                         política. Detalle: {msg}"
+                    ));
+                }
+                Err(e) => return Err(format!("S4U2Proxy rechazado: {e}")),
+            };
+            println!(
+                "{} ticket delegado: cliente {}, destino {} (etype {})",
+                "s4u2proxy:".bold(),
+                final_st.cname.green(),
+                final_st.ticket.sname.flat().cyan(),
+                final_st.ticket.enc_part.etype
+            );
+            // 4) Prueba de la delegación: el ticket final va cifrado con la
+            // clave larga del servicio DESTINO. Descifrándolo con ella, el
+            // PAC muestra al usuario suplantado — sin que el usuario haya
+            // participado. Mismo criterio que en s4u2self: el KDC elige el
+            // etype del ticket y la clave se adapta.
+            if let Some(dbpass) = &to_password {
+                let db_salt = learn_salt(&c, &to, &realm)?;
+                let db_key = if final_st.ticket.enc_part.etype == etype_mod::RC4_HMAC {
+                    KerberosKey::from_password(dbpass, &db_salt, etype_mod::RC4_HMAC)
+                } else {
+                    KerberosKey::from_password(dbpass, &db_salt, etype_mod::AES256_CTS_HMAC_SHA1_96)
+                }
+                .map_err(|e| format!("no pude derivar la clave de {to}: {e}"))?;
+                match charon_krb5::pac::extract_pac(&final_st.ticket, &db_key) {
+                    Ok(pac) => match pac.client_info() {
+                        Some((_, name)) => println!(
+                            "  PAC CLIENT INFO del ticket delegado: {} {}",
+                            name.green(),
+                            format!("(delegado por {user}, no por {impersonate})").dimmed()
+                        ),
+                        None => println!("  PAC buffers: {:?}", pac.buffers.iter().map(|b| b.buffer_type).collect::<Vec<_>>()),
+                    },
+                    Err(e) => println!("  PAC: {e}"),
+                }
+            } else {
+                println!(
+                    "  (sin --to-password no se descifra el ticket final; añádela para ver el PAC del suplantado)"
+                );
+            }
+            Ok(())
+        }
+
         Command::Matrix { realm, user, password, aes_only_user, no_preauth_user, spn_with_aes, spn_rc4_only, ghost_user, profile, dc, port, out } => {
             let c = conn(&dc, port);
             // El salt se aprende del propio KDC (el flujo canónico del proyecto).
@@ -784,6 +1020,29 @@ fn resolve_users(input: &[String]) -> Result<Vec<String>, String> {
         }
     }
     Ok(out)
+}
+
+/// Pares `usuario:contraseña` del spray. Envuelve la lista para hacer
+/// `zeroize` de las contraseñas al soltarla (Drop): el patrón ya existía
+/// para las claves de `kcrypto` (Ronda 1) y la Ronda 2 lo dejó pendiente
+/// para los pares — el fichero de pares lleva secretos en claro, y no
+/// deben quedar copias en memoria liberada.
+struct SprayPairs(Vec<(String, String)>);
+
+impl std::ops::Deref for SprayPairs {
+    type Target = Vec<(String, String)>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for SprayPairs {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for (_, pw) in self.0.iter_mut() {
+            pw.zeroize();
+        }
+    }
 }
 
 /// Carga un fichero de pares `usuario:contraseña` (uno por línea) para

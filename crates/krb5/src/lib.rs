@@ -5,6 +5,7 @@
 //! Construido directamente sobre `charon-asn1`; cada campo de cada
 //! builder está comentado con su tag y su RFC.
 
+pub mod ccache;
 pub mod error_codes;
 pub mod msgs;
 pub mod pac;
@@ -38,6 +39,9 @@ pub enum Krb5Error {
 
     #[error("la respuesta no es de este realm/principal: {0}")]
     BadReply(String),
+
+    #[error("ccache inválido: {0}")]
+    BadCcache(String),
 }
 
 pub type Result<T> = std::result::Result<T, Krb5Error>;
@@ -310,10 +314,10 @@ impl Ticket {
         let mut r = charon_asn1::DerReader::new(bytes);
         let el = r.next_tag(TAG_TICKET)?;
         r.finish()?;
-        let mut seq = el.content_reader();
-        let body = seq.next_tag(charon_asn1::Tag::SEQUENCE)?;
-        seq.finish()?;
-        Self::from_body(&body)
+        // `el` es el wrapper [APPLICATION 1]: from_body ya baja él solo a
+        // la SEQUENCE interior (antes se bajaba dos veces: bug latente sin
+        // llamador hasta el ccache, que lo destapó con su round-trip).
+        Self::from_body(&el)
     }
 
     pub(crate) fn from_body(el: &Element<'_>) -> Asn1Result<Ticket> {
@@ -357,8 +361,15 @@ pub mod kdc_options {
     pub const CANONICALIZE: u32 = bit(15);
     /// RFC 4120 §5.2.2: renovación de un ticket RENEWABLE existente.
     pub const RENEW: u32 = bit(30);
-    /// S4U2Proxy: el cname va en el additional-ticket (MS-SFU §2.2.2).
-    pub const C_NAME_IN_ADDITIONAL_TICKET: u32 = bit(27);
+    /// S4U2Proxy: el cname va en el additional-ticket (MS-SFU §2.2.3).
+    /// krb5.h: KDC_OPT_CNAME_IN_ADDL_TKT = 0x00020000 → bit(14). OJO:
+    /// 0x00000010 es KDC_OPT_RENEWABLE_OK — la Ronda 2 fijó aquí ese
+    /// literal por una transcripción errónea y el test de regresión la
+    /// convalidó; el intento real de S4U2Proxy contra MIT lo destapó (el
+    /// KDC ignoraba la opción y emitía un TGS plano).
+    pub const C_NAME_IN_ADDITIONAL_TICKET: u32 = bit(14);
+    /// krb5.h: KDC_OPT_RENEWABLE_OK = 0x00000010 → bit(27).
+    pub const RENEWABLE_OK: u32 = bit(27);
 }
 
 pub mod ticket_flags {

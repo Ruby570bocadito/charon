@@ -239,10 +239,18 @@ fn kdc_options_coinciden_con_las_constantes_de_mit_krb5h() {
     // ASN.1 "15 is reserved for canonicalize" y MIT krb5.h en 0x00010000.
     // El bit() del repo cuenta desde el MSB del BIT STRING (bit 0 =
     // 0x80000000), como exige la codificación ASN.1 de Kerberos.
+    //
+    // Regresión de la ronda 3: C_NAME_IN_ADDITIONAL_TICKET estaba fijado
+    // a 0x00000010 — que en krb5.h es KDC_OPT_RENEWABLE_OK — por una
+    // transcripción errónea que el propio test convalidaba. El literal
+    // real de krb5.h es KDC_OPT_CNAME_IN_ADDL_TKT = 0x00020000 (bit 14);
+    // el intento real de S4U2Proxy contra el KDC MIT lo destapó: sin la
+    // opción, el KDC emitía un TGS plano ignorando el evidence ticket.
     assert_eq!(kdc_options::FORWARDABLE, 0x4000_0000);
     assert_eq!(kdc_options::PROXIABLE, 0x1000_0000);
     assert_eq!(kdc_options::RENEWABLE, 0x0080_0000);
     assert_eq!(kdc_options::CANONICALIZE, 0x0001_0000);
+    assert_eq!(kdc_options::C_NAME_IN_ADDITIONAL_TICKET, 0x0002_0000);
+    assert_eq!(kdc_options::RENEWABLE_OK, 0x0000_0010);
     assert_eq!(kdc_options::RENEW, 0x0000_0002);
-    assert_eq!(kdc_options::C_NAME_IN_ADDITIONAL_TICKET, 0x0000_0010);
 }

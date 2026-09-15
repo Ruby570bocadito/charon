@@ -278,6 +278,113 @@ fn t12_renew_rejected_for_non_renewable_tgt() {
     assert!(msg.contains("BADOPTION") || msg.contains("13"), "el KDC debe responder BADOPTION(13): {msg}");
 }
 
+/// El ciclo de persistencia completo: TGT renovable → ccache FILE v4 →
+/// recarga SIN credenciales → renovación por el cable → el TGT renovado
+/// se re-persiste. Verifica además el round-trip exacto del material
+/// (clave de sesión, flags, tiempos, ticket) y que el fichero resultante
+/// lo parsea de nuevo Charon (la interoperabilidad con klist/kinit de MIT
+/// se verificó en vivo en la ronda 3 y se documenta en el informe).
+#[test]
+fn t13_ccache_save_load_and_renew_without_credentials() {
+    let _guard = lock();
+    if !kdc_available() {
+        eprintln!("SKIP: KDC no disponible");
+        return;
+    }
+    let key = KerberosKey::from_password("Jdoe!Pass42", "LAB.LOCALjdoe", etype::AES256_CTS_HMAC_SHA1_96).unwrap();
+    let till = charon_asn1::KrbTime::now().plus_secs(7 * 86_400);
+    let tgt = request_tgt_renewable(&conn(), "jdoe", REALM, &key, &[18], till).unwrap();
+
+    let path = std::env::temp_dir().join(format!("charon-t13-{}.ccache", std::process::id()));
+    let path = path.to_str().unwrap();
+    ccache::save_tgt(path, &tgt).expect("guarda el TGT en ccache");
+
+    // Permisos 0600: el fichero lleva la clave de sesión en claro.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "el ccache debe quedar en 0600");
+    }
+
+    let loaded = ccache::load_tgt(path).expect("recarga sin credenciales");
+    assert_eq!(loaded.crealm, tgt.crealm);
+    assert_eq!(loaded.cname, tgt.cname);
+    assert_eq!(loaded.session_key, tgt.session_key, "clave de sesión intacta en el round-trip");
+    assert_eq!(loaded.flags, tgt.flags);
+    assert_eq!(loaded.authtime, tgt.authtime);
+    assert_eq!(loaded.endtime, tgt.endtime);
+    assert_eq!(loaded.renew_till, tgt.renew_till);
+    assert_eq!(loaded.ticket, tgt.ticket, "el ticket DER re-parseado es idéntico");
+
+    // Renovación SIN contraseña desde el material persistido.
+    let renewed = renew_tgt(&conn(), &loaded, till).expect("renueva el TGT cargado del ccache");
+    assert_eq!(renewed.authtime, loaded.authtime, "authtime conservada");
+    assert_ne!(renewed.session_key.keyvalue, loaded.session_key.keyvalue, "clave fresca");
+
+    // Re-persiste el renovado (lo que hace el CLI) y vuelve a cargarlo.
+    ccache::save_tgt(path, &renewed).expect("reescribe el ccache con el renovado");
+    let reloaded = ccache::load_tgt(path).expect("el ccache actualizado sigue cargándose");
+    assert_eq!(reloaded.session_key, renewed.session_key);
+    std::fs::remove_file(path).ok();
+}
+
+/// S4U2Proxy de extremo a extremo hasta el límite REAL del KDC del lab.
+///
+/// (1) El TGT de svc-api se pide FORWARDABLE: MIT 1.21 recorta FORWARDABLE
+/// del ticket emitido si el TGT cabecera no lo trae (kdc_util.c
+/// get_ticket_flags). (2) Con ok_to_auth_as_delegate (script de lab), el
+/// evidence ticket de S4U2Self sale forwardable. (3) La petición S4U2Proxy
+/// es aceptada por el parser del KDC y llega a la evaluación de política —
+/// que con el backend db2 NO PUEDE autorizar ninguna delegación
+/// (check_allowed_to_delegate solo lo implementan los KDB LDAP/test; se
+/// verificó en el código fuente de MIT 1.21): responde KDC_ERR_BADOPTION
+/// con UNSUPPORTED_S4U2PROXY_REQUEST. El test fija ese contrato de cable:
+/// una regresión en la opción C_NAME_IN_ADDL_TKT haría que el KDC emitiere
+/// un TGS PLANO (éxito, cliente=svc-api) en vez del BADOPTION — exactamente
+/// el bug de bit que esta ronda corrigió.
+#[test]
+fn t14_s4u2proxy_evidence_and_kdc_policy_boundary() {
+    let _guard = lock();
+    if !kdc_available() {
+        eprintln!("SKIP: KDC no disponible");
+        return;
+    }
+    // Fixture del lab: principals del script de delegación.
+    let api_key = match probe_as_no_preauth(&conn(), "svc-api", REALM, &[18]) {
+        Ok(AsProbe::PrincipalUnknown { .. }) => {
+            eprintln!("SKIP: fixture de delegación ausente — scripts/lab_setup_delegation.sh");
+            return;
+        }
+        Ok(_) => KerberosKey::from_password("SvcApiPass2026", "LAB.LOCALsvc-api", etype::AES256_CTS_HMAC_SHA1_96).unwrap(),
+        Err(e) => panic!("sonda del fixture falló: {e}"),
+    };
+    let tgt = request_tgt(&conn(), "svc-api", REALM, &api_key, &[18], kdc_options::FORWARDABLE).unwrap();
+    assert!(
+        tgt.flags & charon_krb5::ticket_flags::FORWARDABLE != 0,
+        "el TGT del servicio debe ser forwardable (pedido en el AS-REQ)"
+    );
+
+    let evidence = s4u2self(&conn(), &tgt, "svc-api", "jdoe", REALM).unwrap();
+    assert_eq!(evidence.cname, "jdoe", "el evidence ticket es para el suplantado");
+    assert!(
+        evidence.flags & charon_krb5::ticket_flags::FORWARDABLE != 0,
+        "MIT concede FORWARDABLE al evidence ticket con ok_to_auth_as_delegate (MS-SFU)"
+    );
+
+    let err = s4u2proxy(&conn(), &tgt, &evidence.ticket, "svc-db", "jdoe", REALM, &[18, 23])
+        .expect_err("db2 no autoriza delegación: debe fallar en política");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("BADOPTION"),
+        "la política del KDC responde BADOPTION (no un error de formato): {msg}"
+    );
+    assert!(
+        msg.contains("UNSUPPORTED_S4U2PROXY_REQUEST"),
+        "el status confirma que la petición llegó a la evaluación de política S4U2Proxy: {msg}"
+    );
+}
+
 fn other_desc(p: &AsProbe) -> String {
     match p {
         AsProbe::PreauthRequired { .. } => "PreauthRequired".to_string(),
