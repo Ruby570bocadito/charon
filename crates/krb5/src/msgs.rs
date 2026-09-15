@@ -325,6 +325,11 @@ pub struct EncKdcRepPart {
     pub renew_till: Option<KrbTime>,
     pub srealm: String,
     pub sname: PrincipalName,
+    /// `encrypted-pa-data [12]` (RFC 4120 §5.4.2; MIT DEFFIELD enc_kdc_rep_12,
+    /// asn1_k_encode.c 423-424). MIT 1.21 lo usa para devolver PA-PAC-OPTIONS
+    /// cuando la petición lo lleva (kdc_add_pa_pac_options, kdc_util.c): el
+    /// parser debe tolerarlo o todo TGS-REP con bit RBCD queda sin parsear.
+    pub enc_padata: Vec<PaData>,
 }
 
 impl EncKdcRepPart {
@@ -340,9 +345,15 @@ impl EncKdcRepPart {
         let renew_till = self.renew_till.map(|t| crate::build_time_field(8, &t)).transpose()?;
         let srealm = ctx_str(9, &self.srealm);
         let sname = encode_context_wrapped(10, &self.sname.build()?)?;
+        let enc_padata = if self.enc_padata.is_empty() {
+            None
+        } else {
+            Some(encode_context_wrapped(12, &PaData::build_seq(&self.enc_padata)?)?)
+        };
         let children: Vec<Vec<u8>> = [
             Some(key), Some(last_req), Some(nonce), None::<Vec<u8>>, Some(flags), Some(authtime),
-            starttime, Some(endtime), renew_till, Some(srealm), Some(sname),
+            starttime, Some(endtime), renew_till, Some(srealm), Some(sname), None::<Vec<u8>>,
+            enc_padata,
         ]
         .into_iter()
         .flatten()
@@ -392,8 +403,15 @@ impl EncKdcRepPart {
             .map(|x| x.unwrap_context().and_then(|i| PrincipalName::parse(&i)))
             .transpose()?;
         let sname = sname_opt.unwrap_or_else(|| PrincipalName::user("<desconocido>"));
+        // encrypted-pa-data [12]: opcional; con RBCD MIT devuelve aquí el
+        // PA-PAC-OPTIONS eco de la petición.
+        let enc_padata = f
+            .context_child(12)?
+            .map(|x| x.unwrap_context().and_then(|i| PaData::parse_seq(&i)))
+            .transpose()?
+            .unwrap_or_default();
         f.finish()?;
-        Ok(EncKdcRepPart { key, nonce, flags, authtime, starttime, endtime, renew_till, srealm, sname })
+        Ok(EncKdcRepPart { key, nonce, flags, authtime, starttime, endtime, renew_till, srealm, sname, enc_padata })
     }
 }
 

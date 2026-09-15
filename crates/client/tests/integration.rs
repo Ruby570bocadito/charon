@@ -532,3 +532,94 @@ fn t16_s4u2proxy_end_to_end_con_test_kdb() {
     let (_, client) = pac.client_info().expect("el PAC lleva CLIENT INFO");
     assert_eq!(client, "user", "el PAC del ticket delegado acredita al usuario suplantado");
 }
+
+/// Clave larga de un principal del realm deleg, desde SU keytab del lab.
+fn deleg_key(name: &str, qualified: &str) -> Option<KerberosKey> {
+    let kt = deleg_keytab(name)?;
+    let entries = charon_krb5::keytab::parse(&std::fs::read(&kt).expect("keytab del lab deleg legible"))
+        .expect("el keytab del lab deleg parsea");
+    let e = entries
+        .iter()
+        .find(|e| e.qualified() == qualified)
+        .unwrap_or_else(|| panic!("{qualified} en el keytab del lab deleg"));
+    Some(KerberosKey::from_raw(e.enctype, &e.key).unwrap())
+}
+
+/// t17 — RBCD puro END-TO-END (MS-KILE §2.2.10): S4U2Proxy con el padata
+/// PA-PAC-OPTIONS y el bit resource-based, autorizado por la política del
+/// RECURSO (tabla `rbcd` del módulo test, kdb_test.c 748-778).
+///
+/// La prueba distingue la vía RBCD de la tradicional POR CONSTRUCCIÓN: el
+/// destino del ticket delegado es `service/1`, que NO figura como destino
+/// en la tabla `delegation` (solo service/1 → service/2) — la autorización
+/// solo puede venir de la entrada `rbcd: service/1@DELEG.LAB =
+/// service/1@DELEG.LAB` consultada PORQUE el cable lleva el bit. Sin el
+/// lab deleg (lab/setup-test-kdb.sh) el test se salta.
+#[test]
+fn t17_rbcd_end_to_end_con_tabla_rbcd() {
+    let _guard = lock();
+    if !deleg_kdc_available() {
+        eprintln!("SKIP: KDC test-KDB no disponible (lab/setup-test-kdb.sh, puerto {DELEG_PORT})");
+        return;
+    }
+    let Some(key1) = deleg_key("service1.keytab", "service/1@DELEG.LAB") else {
+        eprintln!("SKIP: keytabs del realm deleg ausentes (lab/setup-test-kdb.sh)");
+        return;
+    };
+
+    let dconn = KdcConnection::new(HOST, DELEG_PORT);
+    // 1) TGT del impersonador.
+    let tgt = request_tgt(&dconn, "service/1", DELEG_REALM, &key1, &[etype::AES256_CTS_HMAC_SHA1_96], kdc_options::FORWARDABLE)
+        .expect("TGT de service/1 con la clave hash del módulo test");
+    // 2) Evidence ticket del suplantado.
+    let evidence = s4u2self(&dconn, &tgt, "service/1", "user", DELEG_REALM)
+        .expect("S4U2Self contra el KDC test");
+    assert_eq!(evidence.cname, "user");
+    // 3) S4U2Proxy RBCD: el recurso service/1 autoriza (tabla rbcd), la
+    // tradicional NO cubre este destino — si el KDC respondió, fue por el
+    // bit del cable.
+    let final_st = s4u2proxy_rbcd(&dconn, &tgt, &evidence.ticket, "service/1", "user", DELEG_REALM, &[18, 23])
+        .expect("la delegación RBCD debe estar autorizada por la tabla rbcd del recurso");
+    assert_eq!(final_st.cname, "user", "el ticket delegado es del usuario suplantado");
+    assert_eq!(final_st.ticket.sname.flat(), "service/1", "el destino es el RECURSO de la tabla rbcd");
+    // 4) El ticket delegado se descifra con la clave del RECURSO y su PAC
+    // acredita al suplantado — el ciclo MS-SFU completo por la vía RBCD.
+    let pac = charon_krb5::pac::extract_pac(&final_st.ticket, &key1)
+        .expect("el ticket final se descifra con la clave de service/1 (recurso)");
+    let (_, client) = pac.client_info().expect("el PAC lleva CLIENT INFO");
+    assert_eq!(client, "user", "el PAC del ticket RBCD acredita al usuario suplantado");
+}
+
+/// t18 — el espejo negativo del t17: la MISMA petición (destino service/1,
+/// no cubierto por la tabla tradicional) SIN el bit RBCD en el cable es
+/// rechazada con KDC_ERR_BADOPTION. Si el KDC la autorizara, el bit no
+/// conmutaría nada; si fallara por otra razón (formato, preauth), el
+/// mensaje no sería BADOPTION. El par t17+t18 demuestra que Charon emite
+/// un cable PA-PAC-OPTIONS que el KDC de referencia interpreta.
+#[test]
+fn t18_s4u2proxy_sin_bit_rbcd_rechazado_por_política() {
+    let _guard = lock();
+    if !deleg_kdc_available() {
+        eprintln!("SKIP: KDC test-KDB no disponible (lab/setup-test-kdb.sh, puerto {DELEG_PORT})");
+        return;
+    }
+    let Some(key1) = deleg_key("service1.keytab", "service/1@DELEG.LAB") else {
+        eprintln!("SKIP: keytabs del realm deleg ausentes (lab/setup-test-kdb.sh)");
+        return;
+    };
+
+    let dconn = KdcConnection::new(HOST, DELEG_PORT);
+    let tgt = request_tgt(&dconn, "service/1", DELEG_REALM, &key1, &[etype::AES256_CTS_HMAC_SHA1_96], kdc_options::FORWARDABLE)
+        .expect("TGT de service/1");
+    let evidence = s4u2self(&dconn, &tgt, "service/1", "user", DELEG_REALM).expect("S4U2Self");
+
+    // S4U2Proxy TRADICIONAL hacia service/1: la tabla delegation no lo
+    // cubre y el cable no lleva el bit → el KDC niega la política.
+    let err = s4u2proxy(&dconn, &tgt, &evidence.ticket, "service/1", "user", DELEG_REALM, &[18, 23])
+        .expect_err("sin bit RBCD el KDC debe negar la delegación hacia service/1");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("BADOPTION"),
+        "la negación debe venir de la política (KDC_ERR_BADOPTION), no de otro fallo: {msg}"
+    );
+}

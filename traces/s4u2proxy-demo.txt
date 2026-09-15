@@ -1,0 +1,3 @@
+s4u2self: evidence ticket service/1 → user (etype 18, forwardable: sí)
+s4u2proxy: ticket delegado: cliente user, destino service/1 (etype 18) [RBCD]
+  PAC CLIENT INFO del ticket delegado: user (delegado por service/1, no por user)

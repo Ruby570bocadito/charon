@@ -41,6 +41,13 @@ Las herramientas actuales tratan Kerberos como caja negra:
   un KDC con política de delegación real (módulo test KDB de MIT): evidence
   ticket forwardable → ticket delegado → PAC del suplantado descifrado con
   la clave del destino.
+- **RBCD puro (--rbcd)**: el cable lleva **PA-PAC-OPTIONS** con el bit
+  resource-based (MS-KILE §2.2.10, bit 0x10000000 — el mismo padata que emite
+  el cliente de referencia de MIT en todo S4U2Proxy, byte a byte verificado)
+  y la autorización la decide la política del **RECURSO** (en AD:
+  `msDS-AllowedToActOnBehalfOfOtherIdentity`; en el lab: la tabla `rbcd` del
+  módulo test). Los tests t17/t18 demuestran por cable que el bit conmuta la
+  vía de política del KDC.
 - **Persistencia de material (M2b)**: escritura/lectura del formato ccache
   FILE v4 de MIT (verificado contra klist/kinit reales) — guarda el TGT y
   renueva sin recredencializar — y **lectura de keytabs** FILE v1/v2 de MIT
@@ -51,6 +58,10 @@ Las herramientas actuales tratan Kerberos como caja negra:
   `s4u2proxy` (además de enum/kerberoast/asreproast/spray/decode/keytab)
   emiten un objeto JSON por comando con los mismos campos normalizados
   (identidad, etypes, flags con nombre, tiempos, fuente de clave, PAC).
+  **Enum y spray** emiten arrays con estados snake_case estables
+  (`exists_preauth`/`no_preauth`/`unknown`/`valid`/`wrong_password`/
+  `kdc_error`/`protocol_error`) y campos dedicados (salts, códigos del KDC)
+  — sin acoplarse a la representación interna de los tipos.
 - **Trace (M3)**: cada mensaje decodificado campo a campo, con explicación
   en español y referencia al RFC — texto coloreado o JSON.
 - **Matriz KDC (M4)**: batería de sondas válidas, casi válidas y
@@ -192,11 +203,23 @@ charon s4u2proxy --user svc-api --impersonate jdoe --to svc-db -r LAB.LOCAL
 charon s4u2proxy --user service/1 --keytab service1.keytab --impersonate user \
     --to service/2 --to-keytab service2.keytab -r DELEG.LAB --port 1190
 
+# RBCD puro: PA-PAC-OPTIONS con el bit resource-based (MS-KILE §2.2.10) —
+# la política la decide el RECURSO (--to), como en AD moderno
+# (msDS-AllowedToActOnBehalfOfOtherIdentity). Sin --rbcd la autorización es
+# la tradicional (tabla delegation / msDS-AllowedToDelegateTo)
+charon s4u2proxy --user service/1 --keytab service1.keytab --impersonate user \
+    --to service/1 --to-keytab service1.keytab --rbcd -r DELEG.LAB --port 1190
+
 # Salida JSON uniforme en los comandos de sesión (un objeto por comando:
 # crealm/cname/sname, session_etype, flags con nombre, authtime/endtime/
-# renew_till, key_source; en S4U, pac_client/pac_error)
+# renew_till, key_source; en S4U, pac_client/pac_error y rbcd)
 charon as --user jdoe --keytab jdoe.keytab -r LAB.LOCAL --json
 charon s4u2proxy ... --json | jq '.pac_client'
+
+# JSON estructurado de enum y spray: estados snake_case estables y campos
+# dedicados (salts del error 25, códigos del KDC) para consumir con jq
+charon enum --users jdoe,ghost -r LAB.LOCAL --json | jq '.[] | select(.exists)'
+charon spray --pairs pares.txt -r LAB.LOCAL --json | jq '.[] | select(.valid)'
 
 # Trace de cualquier mensaje capturado (DER crudo)
 charon decode --file as-rep.bin -r LAB.LOCAL --user jdoe
@@ -258,7 +281,9 @@ bash lab/setup-test-kdb.sh          # configura, exporta keytabs y arranca
 bash lab/setup-test-kdb.sh status   # comprueba el pidfile
 bash lab/setup-test-kdb.sh stop     # para SOLO este KDC (pidfile)
 
-cargo test -p charon-client --test integration t16_   # end-to-end MS-SFU
+cargo test -p charon-client --test integration t16_   # end-to-end MS-SFU tradicional
+cargo test -p charon-client --test integration t17_   # end-to-end RBCD (tabla rbcd)
+cargo test -p charon-client --test integration t18_   # sin bit RBCD → BADOPTION
 ```
 
 Los principals viven en texto plano del `kdc.conf` (el módulo no usa BD);
@@ -270,6 +295,17 @@ t16 (`crates/client/tests/integration.rs`). Nota del módulo: no acepta
 contraseñas (las claves son hash internos) y sus flags van en hexadecimal
 en el kdc.conf — `krb5_flagspec_to_mask` solo parsea UN flag por cadena y
 el módulo aborta con dos (quirk documentado en el script).
+
+**RBCD en el lab**: el kdc.conf del segundo KDC incluye también la tabla
+`rbcd` (política resource-based, `test_allowed_to_delegate_from` de
+kdb_test.c) con la entrada `service/1@DELEG.LAB = service/1@DELEG.LAB` —
+nombres **CON reino**, a diferencia de la tabla `delegation` que los lleva
+sin reino (diferencia crítica documentada en el script: copiar el estilo de
+una tabla en la otra produce un lab que niega todo sin pista del motivo).
+Con esa entrada, `charon s4u2proxy --rbcd --to service/1 ...` queda
+autorizado SOLO por la vía resource-based (el destino no está en la tabla
+delegación): el par de tests t17 (aceptada con el bit) / t18 (BADOPTION sin
+el bit) demuestra por cable que PA-PAC-OPTIONS conmuta la política del KDC.
 
 ## Estructura del proyecto
 

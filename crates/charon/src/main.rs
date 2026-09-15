@@ -346,6 +346,14 @@ enum Command {
         /// Exclusivo con --to-password.
         #[arg(long)]
         to_keytab: Option<String>,
+        /// Delegación resource-based (MS-KILE §2.2.10): añade PA-PAC-
+        /// OPTIONS con el bit RBCD y el KDC consulta la política en el
+        /// RECURSO (--to), no en el impersonador — el esquema de AD
+        /// moderno (msDS-AllowedToActOnBehalfOfOtherIdentity). Sin este
+        /// flag la autorización es la tradicional (tabla delegation /
+        /// msDS-AllowedToDelegateTo).
+        #[arg(long)]
+        rbcd: bool,
         #[arg(short, long)]
         realm: String,
         #[arg(long, default_value = "127.0.0.1")]
@@ -441,10 +449,8 @@ fn run(cli: Cli) -> Result<(), String> {
                 results.push((u.clone(), status));
             }
             if json {
-                let json_items: Vec<serde_json::Value> = results
-                    .iter()
-                    .map(|(u, st)| serde_json::json!({"user": u, "status": format!("{st:?}")}))
-                    .collect();
+                let json_items: Vec<serde_json::Value> =
+                    results.iter().map(|(u, st)| user_status_json(u, st)).collect();
                 println!("{}", serde_json::to_string_pretty(&json_items).map_err(|e| e.to_string())?);
             } else {
                 let exists = results.iter().filter(|(_, s)| s.exists()).count();
@@ -593,16 +599,19 @@ fn run(cli: Cli) -> Result<(), String> {
                         if !json {
                             print_spray(&att);
                         }
-                        rows.push(serde_json::json!({
-                            "user": att.user,
-                            "result": format!("{:?}", att.result),
-                        }));
+                        rows.push(spray_result_json(&att.user, &att.result));
                     }
                     Err(e) => {
                         if !json {
                             println!("{} {}: fallo de protocolo: {e}", "✗".red().bold(), u.cyan());
                         }
-                        rows.push(serde_json::json!({"user": u, "error": e}));
+                        // Fallo de transporte/protocolo: sin clasificación
+                        // del KDC, el estado lo dice explícito.
+                        rows.push(serde_json::json!({
+                            "user": u,
+                            "state": "protocol_error",
+                            "error": e.to_string(),
+                        }));
                     }
                 }
             }
@@ -1089,7 +1098,7 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
 
-        Command::S4u2proxy { user, password, password_stdin, keytab, salt, impersonate, to, to_password, to_keytab, realm, dc, port, json } => {
+        Command::S4u2proxy { user, password, password_stdin, keytab, salt, impersonate, to, to_password, to_keytab, rbcd, realm, dc, port, json } => {
             let c = conn(&dc, port);
             // Fuente de clave exclusiva para el servicio que DELEGA (mismo
             // criterio que `as` y `s4u2self`). --to-password es indepen-
@@ -1176,26 +1185,52 @@ fn run(cli: Cli) -> Result<(), String> {
                 ));
             }
             // 3) S4U2Proxy: ticket del usuario hacia el servicio destino.
-            let final_st = match charon_client::s4u2proxy(
-                &c,
-                &tgt,
-                &evidence.ticket,
-                &to,
-                &impersonate,
-                &realm,
-                &[etype_mod::AES256_CTS_HMAC_SHA1_96, etype_mod::RC4_HMAC],
-            ) {
+            // Con --rbcd el cable lleva PA-PAC-OPTIONS con el bit RBCD
+            // (el cable del cliente de referencia, MIT s4u_creds.c 1013)
+            // y la autorización la decide la política del RECURSO.
+            let proxy_result = if rbcd {
+                charon_client::s4u2proxy_rbcd(
+                    &c,
+                    &tgt,
+                    &evidence.ticket,
+                    &to,
+                    &impersonate,
+                    &realm,
+                    &[etype_mod::AES256_CTS_HMAC_SHA1_96, etype_mod::RC4_HMAC],
+                )
+            } else {
+                charon_client::s4u2proxy(
+                    &c,
+                    &tgt,
+                    &evidence.ticket,
+                    &to,
+                    &impersonate,
+                    &realm,
+                    &[etype_mod::AES256_CTS_HMAC_SHA1_96, etype_mod::RC4_HMAC],
+                )
+            };
+            let final_st = match proxy_result {
                 Ok(st) => st,
                 Err(charon_client::ClientError::Krb5(charon_krb5::Krb5Error::BadReply(msg)))
                     if msg.contains("KDC_ERR_BADOPTION") =>
                 {
+                    if rbcd {
+                        return fail(format!(
+                            "S4U2Proxy RBCD rechazado con KDC_ERR_BADOPTION: el recurso {to} \
+                             no autoriza a {user} a delegar en su nombre (política \
+                             resource-based: en AD, msDS-AllowedToActOnBehalfOfOtherIdentity \
+                             del destino; en el lab test-KDB, la tabla rbcd con nombres \
+                             CON reino). Detalle: {msg}"
+                        ));
+                    }
                     return fail(format!(
                         "S4U2Proxy rechazado con KDC_ERR_BADOPTION. Diagnóstico: \
                          MIT con backend db2 NO puede autorizar ninguna delegación \
                          (la política vive en el KDB: solo LDAP o el módulo test de \
                          MIT implementan allowed_to_delegate — ver informe de ronda y \
                          docs/threat-model.md; el lab trae un segundo KDC test-KDB con \
-                         tabla de delegación en lab/setup-test-kdb.sh). Detalle: {msg}"
+                         tabla de delegación en lab/setup-test-kdb.sh; con política \
+                         resource-based usa --rbcd). Detalle: {msg}"
                     ));
                 }
                 Err(e) => return Err(format!("S4U2Proxy rechazado: {e}")),
@@ -1278,6 +1313,7 @@ fn run(cli: Cli) -> Result<(), String> {
                         "ticket_sname": final_st.ticket.sname.flat(),
                         "ticket_etype": final_st.ticket.enc_part.etype,
                         "ticket_etype_name": etype_name(final_st.ticket.enc_part.etype),
+                        "rbcd": rbcd,
                         "pac_client": pac_client,
                         "pac_error": pac_error,
                         "key_source": key_source,
@@ -1286,11 +1322,12 @@ fn run(cli: Cli) -> Result<(), String> {
                 return Ok(());
             }
             println!(
-                "{} ticket delegado: cliente {}, destino {} (etype {})",
+                "{} ticket delegado: cliente {}, destino {} (etype {}){}",
                 "s4u2proxy:".bold(),
                 final_st.cname.green(),
                 final_st.ticket.sname.flat().cyan(),
-                final_st.ticket.enc_part.etype
+                final_st.ticket.enc_part.etype,
+                if rbcd { " [RBCD]".yellow().to_string() } else { String::new() }
             );
             match (pac_client, pac_error) {
                 (Some(name), _) => println!(
@@ -1581,6 +1618,82 @@ fn print_spray(a: &charon_attacks::SprayAttempt) {
             println!("{} {} — error KDC {code} {detail}", "!".yellow().bold(), a.user.cyan())
         }
     }
+}
+
+/// JSON estructurado de un UserStatus (contrato de la Ronda VI, sin el
+/// Debug de Rust: estados snake_case estables y campos dedicados para
+/// salts y códigos — consumidores `jq` sin acoplarse a nombres internos).
+fn user_status_json(user: &str, st: &charon_attacks::UserStatus) -> serde_json::Value {
+    use charon_attacks::UserStatus as US;
+    let mut obj = serde_json::json!({ "user": user });
+    match st {
+        US::ExistsWithPreauth { salts } => {
+            obj["exists"] = serde_json::json!(true);
+            obj["state"] = serde_json::json!("exists_preauth");
+            obj["salts"] = serde_json::json!(salts
+                .iter()
+                .map(|(etype, salt)| serde_json::json!({
+                    "etype": etype,
+                    "etype_name": etype_name(*etype),
+                    "salt": salt,
+                }))
+                .collect::<Vec<_>>());
+        }
+        US::ExistsWithoutPreauth => {
+            obj["exists"] = serde_json::json!(true);
+            obj["state"] = serde_json::json!("no_preauth");
+            obj["asreproastable"] = serde_json::json!(true);
+        }
+        US::Unknown => {
+            obj["exists"] = serde_json::json!(false);
+            obj["state"] = serde_json::json!("unknown");
+        }
+        US::PreauthFailed => {
+            obj["exists"] = serde_json::json!(true);
+            obj["state"] = serde_json::json!("preauth_failed");
+        }
+        US::Other(code) => {
+            obj["exists"] = serde_json::json!(true);
+            obj["state"] = serde_json::json!("other");
+            obj["code"] = serde_json::json!(code);
+        }
+    }
+    obj
+}
+
+/// JSON estructurado de un SprayResult (mismo contrato que enum: estados
+/// snake_case estables, `valid` explícito, código y detalle aparte).
+fn spray_result_json(user: &str, r: &charon_attacks::SprayResult) -> serde_json::Value {
+    use charon_attacks::SprayResult as SR;
+    let mut obj = serde_json::json!({ "user": user });
+    match r {
+        SR::Valid => {
+            obj["valid"] = serde_json::json!(true);
+            obj["state"] = serde_json::json!("valid");
+        }
+        SR::WrongPassword => {
+            obj["valid"] = serde_json::json!(false);
+            obj["state"] = serde_json::json!("wrong_password");
+        }
+        SR::UnknownUser => {
+            obj["valid"] = serde_json::json!(false);
+            obj["state"] = serde_json::json!("unknown_user");
+        }
+        SR::NoPreauth => {
+            obj["valid"] = serde_json::json!(false);
+            obj["state"] = serde_json::json!("no_preauth");
+            obj["asreproastable"] = serde_json::json!(true);
+        }
+        SR::KdcError { code, detail } => {
+            obj["valid"] = serde_json::json!(false);
+            obj["state"] = serde_json::json!("kdc_error");
+            obj["code"] = serde_json::json!(code);
+            if !detail.is_empty() {
+                obj["detail"] = serde_json::json!(detail);
+            }
+        }
+    }
+    obj
 }
 
 /// Aprende el salt del usuario con un AS-REQ sin preauth: el error 25 del

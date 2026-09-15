@@ -151,6 +151,23 @@ EOF
         delegation = {
             service/1 = service/2
         }
+        # RBCD puro (kdb_test.c test_allowed_to_delegate_from, 748-778):
+        # la política vive en el RECURSO — clave = servicio destino que
+        # CONCEDE la delegación, valor = impersonador autorizado. DIFEREN-
+        # CIA crítica con la tabla delegation: la consulta compara nombres
+        # CON reino (krb5_unparse_name SIN el flag KRB5_PRINCIPAL_UNPARSE_
+        # NO_REALM, 760-761) — una entrada estilo "service/1 = service/1"
+        # sin reinos nunca casaría y el KDC respondería BADOPTION sin
+        # pista del motivo. service/1 es recurso de sí mismo: autoriza el
+        # ciclo RBCD que la tabla delegation NO cubre (service/1 como
+        # DESTINO no está en ella), lo que permite probar por cable que el
+        # bit RBCD conmuta la vía de política (tests t17/t18 de
+        # client/tests/integration.rs). NOTA para editores: sin acentos
+        # abiertos dentro del heredoc — el shell los ejecutaría como
+        # sustitución de comandos (bug real cazado en la Ronda VI).
+        rbcd = {
+            service/1@$REALM = service/1@$REALM
+        }
     }
 
 [logging]

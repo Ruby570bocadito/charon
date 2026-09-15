@@ -278,6 +278,11 @@ pub mod pa_type {
     pub const PA_ETYPE_INFO2: i32 = 19;
     pub const PA_PAC_REQUEST: i32 = 128;
     pub const PA_FOR_USER: i32 = 129;
+    /// PA-PAC-OPTIONS (MS-KILE §2.2.10, MS-SFU; MIT krb5.h 1840). Un BIT
+    /// STRING de opciones dentro de SEQUENCE: el bit resource-based
+    /// constrained delegation conmuta la vía de autorización S4U2Proxy del
+    /// KDC hacia la política del RECURSO (allowed_to_delegate_from).
+    pub const PA_PAC_OPTIONS: i32 = 167;
 }
 
 impl PaData {

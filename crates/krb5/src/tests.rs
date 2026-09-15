@@ -179,6 +179,7 @@ fn kdc_rep_and_enc_rep_part() {
         renew_till: Some(charon_asn1::KrbTime::from_unix(1_750_604_800)),
         srealm: "LAB.LOCAL".into(),
         sname: PrincipalName::krbtgt("LAB.LOCAL"),
+        enc_padata: Vec::new(),
     };
     let pwire = part.build().unwrap();
     let pel = charon_asn1::DerReader::new(&pwire).next().unwrap().unwrap();
@@ -187,6 +188,7 @@ fn kdc_rep_and_enc_rep_part() {
     assert_eq!(pback.nonce, 42);
     assert_eq!(pback.flags, ticket_flags::PRE_AUTHENT | ticket_flags::INITIAL);
     assert_eq!(pback.authtime, part.authtime);
+    assert!(pback.enc_padata.is_empty(), "sin [12] el campo queda vacío");
 }
 
 #[test]

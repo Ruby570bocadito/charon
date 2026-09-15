@@ -656,6 +656,29 @@ pub fn s4u2self(
 
 // ---------- S4U2Proxy (MS-SFU §2.2.3) ----------
 
+/// PA-PAC-OPTIONS (MS-KILE §2.2.10): bit resource-based constrained
+/// delegation. Con este bit el KDC consulta PRIMERO la política del
+/// RECURSO (test_allowed_to_delegate_from en el módulo test, la tabla
+/// `rbcd`; en AD, msDS-AllowedToActOnBehalfOfOtherIdentity) y solo cae a
+/// la tradicional si aquella devuelve BADOPTION (tgs_policy.c 548-578 de
+/// MIT 1.21). Sin el padata la vía RBCD ni se intenta: el bit es el
+/// conmutador real del cable.
+pub const PA_PAC_OPTIONS_RBCD: u32 = 0x1000_0000;
+
+/// Construye el padata PA-PAC-OPTIONS (tipo 167) con los flags pedidos.
+///
+/// Forma del cable: `SEQUENCE { options [0] BIT STRING }` (asn1_k_encode.c
+/// 1701-1708). MIT emite la BIT STRING de 32 bits SIN recortar —
+/// k5_asn1_encode_bitstring (asn1_encode.c 165-170) inserta los 4 bytes de
+/// krb5_flags más el byte de bits sin usar — así que el padata del bit
+/// RBCD es byte a byte `30 09 A0 07 03 05 00 10 00 00 00`, idéntico al que
+/// emite el cliente de referencia (s4u_creds.c add_rbcd_padata, 765-782).
+pub fn build_pa_pac_options(flags: u32) -> Result<PaData> {
+    let bitstring = charon_asn1::encode_bitstring_aligned(&flags.to_be_bytes());
+    let seq = charon_asn1::encode_sequence(&[charon_asn1::encode_context_wrapped(0, &bitstring)?])?;
+    Ok(PaData { pa_type: charon_krb5::pa_type::PA_PAC_OPTIONS, pa_value: seq })
+}
+
 /// S4U2Proxy — la mitad de la delegación que completa el cuadro con
 /// S4U2Self, y el primitivo de RBCD: el servicio presenta su TGT
 /// (PA-TGS-REQ) y el **evidence ticket** de S4U2Self — un ticket del
@@ -682,6 +705,37 @@ pub fn s4u2proxy(
     realm: &str,
     etypes: &[i32],
 ) -> Result<ServiceTicket> {
+    s4u2proxy_ext(conn, service_tgt, evidence, target_spn, impersonated, realm, etypes, false)
+}
+
+/// S4U2Proxy en variante RBCD: añade PA-PAC-OPTIONS con el bit RBCD
+/// (MS-KILE §2.2.10), el cable que el cliente de referencia de MIT emite
+/// SIEMPRE en S4U2Proxy (s4u_creds.c 1013) y el que exigen los KDCs con
+/// política resource-based (AD moderno: la delegación la concede el
+/// RECURSO, no el KDB del impersonador).
+pub fn s4u2proxy_rbcd(
+    conn: &KdcConnection,
+    service_tgt: &Tgt,
+    evidence: &Ticket,
+    target_spn: &str,
+    impersonated: &str,
+    realm: &str,
+    etypes: &[i32],
+) -> Result<ServiceTicket> {
+    s4u2proxy_ext(conn, service_tgt, evidence, target_spn, impersonated, realm, etypes, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn s4u2proxy_ext(
+    conn: &KdcConnection,
+    service_tgt: &Tgt,
+    evidence: &Ticket,
+    target_spn: &str,
+    impersonated: &str,
+    realm: &str,
+    etypes: &[i32],
+    rbcd: bool,
+) -> Result<ServiceTicket> {
     let session_key =
         charon_kcrypto::KerberosKey::from_raw(service_tgt.session_key.keytype, &service_tgt.session_key.keyvalue)?;
     let body = KdcReqBody {
@@ -701,11 +755,31 @@ pub fn s4u2proxy(
         additional_tickets: Some(vec![evidence.clone()]),
     };
     let body_tlv = body.build()?;
-    let req = KdcReq {
-        msg_type: MSG_TGS_REQ,
-        padata: vec![build_pa_tgs_req(service_tgt, &session_key, &body_tlv)?],
-        body,
-    };
+    let mut padata = vec![build_pa_tgs_req(service_tgt, &session_key, &body_tlv)?];
+    if rbcd {
+        padata.push(build_pa_pac_options(PA_PAC_OPTIONS_RBCD)?);
+    }
+    let req = KdcReq { msg_type: MSG_TGS_REQ, padata, body };
     let (reply, _transport) = conn.exchange(&req.build()?)?;
     parse_tgs_reply(&reply, &service_tgt.session_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// El padata PA-PAC-OPTIONS del bit RBCD debe ser byte a byte el que
+    /// emite el cliente de referencia de MIT (add_rbcd_padata,
+    /// s4u_creds.c 765-782): BIT STRING de 32 bits SIN recortar —
+    /// k5_asn1_encode_bitstring inserta los 4 bytes de krb5_flags más el
+    /// byte de bits sin usar — dentro de SEQUENCE { [0] ... }.
+    /// `30 09 A0 07 03 05 00 10 00 00 00`.
+    #[test]
+    fn pa_pac_options_rbcd_wire_form() {
+        let pa = build_pa_pac_options(PA_PAC_OPTIONS_RBCD).expect("el padata codifica");
+        assert_eq!(pa.pa_type, charon_krb5::pa_type::PA_PAC_OPTIONS);
+        assert_eq!(pa.pa_type, 167, "KRB5_PADATA_PAC_OPTIONS (krb5.h 1840)");
+        let expected: Vec<u8> = vec![0x30, 0x09, 0xA0, 0x07, 0x03, 0x05, 0x00, 0x10, 0x00, 0x00, 0x00];
+        assert_eq!(pa.pa_value, expected, "forma del cable idéntica a MIT");
+    }
 }
