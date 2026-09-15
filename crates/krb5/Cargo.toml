@@ -10,3 +10,4 @@ charon-asn1.workspace = true
 charon-kcrypto.workspace = true
 thiserror.workspace = true
 getrandom.workspace = true
+zeroize.workspace = true

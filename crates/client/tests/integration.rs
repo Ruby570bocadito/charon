@@ -385,6 +385,37 @@ fn t14_s4u2proxy_evidence_and_kdc_policy_boundary() {
     );
 }
 
+/// TGT con la clave leída de un keytab REAL de MIT (`charon as --keytab`,
+/// el flujo del analista con material exportado por ktadd/ktutil).
+///
+/// El fixture (`krb5/tests/fixtures/lab-jdoe.keytab`) fue producido por
+/// `ktutil addent` de MIT 1.21.3 con la clave AES256 de jdoe del lab
+/// (contraseña desechable documentada en `lab/setup-mit-kdc.sh`): si el
+/// parser v2 del keytab o nuestra string2key se desvían una sola-byte de
+/// MIT, el KDC responde PREAUTH_FAILED y el test lo caza.
+#[test]
+fn t15_tgt_con_la_clave_de_un_keytab_real() {
+    let _guard = lock();
+    if !kdc_available() {
+        eprintln!("SKIP: KDC no disponible");
+        return;
+    }
+    let bytes = include_bytes!("../../krb5/tests/fixtures/lab-jdoe.keytab");
+    let entries = charon_krb5::keytab::parse(bytes).expect("el keytab del fixture parsea");
+    let entry = entries
+        .iter()
+        .find(|e| e.qualified() == "jdoe@LAB.LOCAL")
+        .expect("el fixture trae la entrada de jdoe");
+    assert_eq!(entry.enctype, etype::AES256_CTS_HMAC_SHA1_96);
+
+    let key = KerberosKey::from_raw(entry.enctype, &entry.key).unwrap();
+    let tgt = request_tgt(&conn(), "jdoe", REALM, &key, &[entry.enctype], kdc_options::FORWARDABLE)
+        .expect("el KDC debe aceptar el preauth cifrado con la clave del keytab");
+    assert_eq!(tgt.crealm, REALM);
+    assert_eq!(tgt.cname, "jdoe");
+    assert_eq!(tgt.ticket.sname.name_string, vec!["krbtgt", "LAB.LOCAL"]);
+}
+
 fn other_desc(p: &AsProbe) -> String {
     match p {
         AsProbe::PreauthRequired { .. } => "PreauthRequired".to_string(),

@@ -189,6 +189,11 @@ enum Command {
         /// klist/kinit de MIT leen el fichero (interoperabilidad real).
         #[arg(long)]
         ccache: Option<String>,
+        /// Autentica con la clave del principal en este keytab (formato
+        /// FILE v1/v2 de MIT, el que escriben ktadd/ktutil): sin
+        /// contraseña. --user elige la entrada; el reino debe coincidir.
+        #[arg(long)]
+        keytab: Option<String>,
         #[arg(long, default_value = "127.0.0.1")]
         dc: String,
         #[arg(long, default_value_t = 88)]
@@ -341,6 +346,16 @@ enum Command {
         /// Fichero de salida (por defecto: stdout).
         #[arg(short, long)]
         out: Option<String>,
+    },
+    /// Lista las entradas de un keytab de MIT (principal, kvno, enctype y
+    /// timestamp). NUNCA imprime las claves: el keytab es material
+    /// sensible y el listado es para inspección, no para volcado.
+    Keytab {
+        /// Ruta del fichero keytab (formato FILE v1/v2 de MIT).
+        #[arg(short, long)]
+        file: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -604,20 +619,50 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
 
-        Command::As { user, password, password_stdin, realm, salt, etype, renewable, ccache, dc, port } => {
+        Command::As { user, password, password_stdin, realm, salt, etype, renewable, ccache, keytab, dc, port } => {
             let c = conn(&dc, port);
-            let password = resolve_password(password, password_stdin)?;
-            let salt = match salt {
-                Some(s) => s,
-                None => learn_salt(&c, &user, &realm)?,
+            // Fuente de clave exclusiva: keytab (claves exportadas por
+            // ktadd/ktutil) o contraseña con su salt. Con keytab no hay
+            // sal que aprender: la clave YA está en el fichero.
+            let (key, req_etypes, key_source) = if let Some(kt_path) = &keytab {
+                if password.is_some() || password_stdin || salt.is_some() {
+                    return fail(
+                        "--keytab es incompatible con --password/--password-stdin/--salt: \
+                         la clave sale del fichero (el salt ya está cocido en ella)"
+                            .into(),
+                    );
+                }
+                let (kt_key, kt_kvno, kt_enctype) = key_from_keytab(kt_path, &user, &realm)?;
+                // Con clave RC4 se pide también 18: MIT 1.21 exige un
+                // etype de sesión no deprecado (lección de passthekey).
+                let etypes = if kt_enctype == etype_mod::RC4_HMAC {
+                    vec![etype_mod::RC4_HMAC, etype_mod::AES256_CTS_HMAC_SHA1_96]
+                } else {
+                    vec![kt_enctype]
+                };
+                (
+                    kt_key,
+                    etypes,
+                    format!("keytab {} (kvno {}, {})", kt_path.yellow(), kt_kvno, etype_name(kt_enctype)),
+                )
+            } else {
+                let password = resolve_password(password, password_stdin)?;
+                let salt = match salt {
+                    Some(s) => s,
+                    None => learn_salt(&c, &user, &realm)?,
+                };
+                (
+                    key_from_credentials(&user, &realm, &salt, &password, None, None)?,
+                    vec![etype.id()],
+                    "contraseña".to_string(),
+                )
             };
-            let key = key_from_credentials(&user, &realm, &salt, &password, None, None)?;
             let tgt = if renewable {
                 let till = charon_asn1::KrbTime::now().plus_secs(7 * 86_400);
-                charon_client::request_tgt_renewable(&c, &user, &realm, &key, &[etype.id()], till)
+                charon_client::request_tgt_renewable(&c, &user, &realm, &key, &req_etypes, till)
                     .map_err(|e| e.to_string())?
             } else {
-                charon_client::request_tgt(&c, &user, &realm, &key, &[etype.id()], 0)
+                charon_client::request_tgt(&c, &user, &realm, &key, &req_etypes, 0)
                     .map_err(|e| e.to_string())?
             };
             let renew_note = if renewable {
@@ -634,6 +679,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 tgt.endtime,
                 renew_note
             );
+            println!("  {} clave del cliente desde {}", "·".dimmed(), key_source.dimmed());
             if let Some(path) = &ccache {
                 charon_client::ccache::save_tgt(path, &tgt)
                     .map_err(|e| format!("no pude escribir el ccache {path}: {e}"))?;
@@ -978,6 +1024,56 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             Ok(())
         }
+
+        Command::Keytab { file, json } => {
+            warn_lax_keytab_perms(&file);
+            let bytes = std::fs::read(&file).map_err(|e| format!("no pude leer {file}: {e}"))?;
+            let entries = charon_krb5::keytab::parse(&bytes)
+                .map_err(|e| format!("keytab {file}: {e}"))?;
+            if json {
+                let items: Vec<serde_json::Value> = entries
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "principal": e.qualified(),
+                            "realm": e.realm,
+                            "kvno": e.kvno,
+                            "enctype": e.enctype,
+                            "enctype_name": etype_name(e.enctype),
+                            "timestamp": e.timestamp,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?);
+            } else {
+                let version_note = if bytes.len() >= 2 && bytes[0] == 0x05 && bytes[1] == 0x01 {
+                    "v1 (compatibilidad DCE)"
+                } else {
+                    "v2 (estándar de MIT)"
+                };
+                println!(
+                    "{} {} (formato {} de MIT, {} entradas)",
+                    "keytab:".bold(),
+                    file.cyan(),
+                    version_note,
+                    entries.len()
+                );
+                for e in &entries {
+                    println!(
+                        "  {}  kvno {:<4} {:<24} {}",
+                        e.qualified().cyan(),
+                        e.kvno,
+                        etype_name(e.enctype).yellow(),
+                        charon_asn1::KrbTime::from_unix(e.timestamp as i64).to_string().dimmed()
+                    );
+                }
+                println!(
+                    "\n{}",
+                    "(las claves no se imprimen: el keytab es material sensible)".dimmed()
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1188,6 +1284,55 @@ fn key_from_credentials(
     // TGT con AES256: la contraseña nunca viaja por el cable, solo el
     // preauth cifrado.
     KerberosKey::from_password(password, _salt, etype_mod::AES256_CTS_HMAC_SHA1_96).map_err(|e| e.to_string())
+}
+
+/// Aviso si el keytab es legible por grupo/otros: el fichero lleva las
+/// claves largas EN CLARO (diseño del formato); MIT lo crea 0600 y así
+/// debe quedarse. Es un aviso a stderr, no un error: leerlo es legítimo.
+#[cfg(unix)]
+fn warn_lax_keytab_perms(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(md) = std::fs::metadata(path) {
+        let mode = md.permissions().mode();
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "{} el keytab {path} es legible por grupo/otros (permisos {:04o}): \
+                 contiene claves en claro — recomendado 0600",
+                "aviso:".yellow().bold(),
+                mode & 0o777
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_lax_keytab_perms(_path: &str) {}
+
+/// Clave a partir de un keytab: la entrada cuyo principal coincide con
+/// `user@realm` (por nombre cualificado o por nombre plano + reino).
+/// AES depende del salt = reino + usuario, así que el reino de la
+/// entrada DEBE coincidir con el pedido — no hay match silencioso entre
+/// reinos distintos. Devuelve la clave junto a su kvno y enctype para
+/// el mensaje del CLI.
+fn key_from_keytab(path: &str, user: &str, realm: &str) -> Result<(KerberosKey, u32, i32), String> {
+    warn_lax_keytab_perms(path);
+    let bytes = std::fs::read(path).map_err(|e| format!("no pude leer {path}: {e}"))?;
+    let entries =
+        charon_krb5::keytab::parse(&bytes).map_err(|e| format!("keytab {path}: {e}"))?;
+    let wanted = format!("{user}@{realm}");
+    let entry = entries
+        .iter()
+        .find(|e| e.qualified() == wanted)
+        .ok_or_else(|| {
+            let list = entries.iter().map(|e| e.qualified()).collect::<Vec<_>>().join(", ");
+            if list.is_empty() {
+                format!("el keytab {path} no tiene entradas")
+            } else {
+                format!("el keytab {path} no trae clave para {wanted} (entradas: {list})")
+            }
+        })?;
+    let key = KerberosKey::from_raw(entry.enctype, &entry.key).map_err(|e| e.to_string())?;
+    Ok((key, entry.kvno, entry.enctype))
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, String> {

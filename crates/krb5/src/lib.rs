@@ -7,6 +7,7 @@
 
 pub mod ccache;
 pub mod error_codes;
+pub mod keytab;
 pub mod msgs;
 pub mod pac;
 
@@ -42,6 +43,9 @@ pub enum Krb5Error {
 
     #[error("ccache inválido: {0}")]
     BadCcache(String),
+
+    #[error("keytab inválido: {0}")]
+    BadKeytab(String),
 }
 
 pub type Result<T> = std::result::Result<T, Krb5Error>;

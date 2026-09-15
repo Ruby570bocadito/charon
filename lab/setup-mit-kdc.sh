@@ -136,12 +136,53 @@ create_db_and_principals() {
 
     # kadmin.local opera directamente sobre la BD (no necesita kadmind).
     # Nota: kadmin -q no interpreta comillas; las contraseñas van sin ellas.
-    "$KADMIN_LOCAL" -r "$REALM" -q "addprinc -pw Jdoe!Pass42 jdoe" >/dev/null
-    "$KADMIN_LOCAL" -r "$REALM" -q "addprinc -pw Aes!User01 -e aes256-cts-hmac-sha1-96:normal,aes128-cts-hmac-sha1-96:normal aesuser" >/dev/null
-    "$KADMIN_LOCAL" -r "$REALM" -q "addprinc -pw Mssql!Svc01 mssql/srv01.lab.local" >/dev/null
-    "$KADMIN_LOCAL" -r "$REALM" -q "addprinc -pw Legacy!RC4 -e arcfour-hmac-md5:normal legacy" >/dev/null
-    "$KADMIN_LOCAL" -r "$REALM" -q "addprinc -no_preauth -pw NoPre!Auth1 nopreauth" >/dev/null
-    echo "[lab] principales creados: jdoe aesuser mssql/srv01.lab.local legacy nopreauth"
+    #
+    # Enctypes EXPLÍCITOS en cada addprinc: MIT 1.21 crea por defecto
+    # SOLO AES256+AES128 (verificado: str_conv/kadmin), y el diseño del
+    # lab necesita RC4 en jdoe/mssql/nopreauth para los primitivos.
+    # addprinc falla con usage error pero SALE 0 (silencioso), así que
+    # add_principal_checked VERIFICA la existencia tras crear.
+    #
+    # nopreauth: "-no_preauth" NO es un flagspec válido de kadmin (la
+    # tabla de atributos solo tiene preauth/requires_preauth —
+    # lib/kadm5/str_conv.c): el prefijo '-' de -requires_preauth LIMPIA
+    # el flag. Con el default_principal_flags=+preauth del kdc.conf, el
+    # principal sale SIN preauth requerido, que es lo que el AS-REP
+    # roasting necesita.
+    add_principal_checked() {
+        local desc="$1"; shift
+        "$KADMIN_LOCAL" -r "$REALM" -q "$*" >/dev/null
+        local principal
+        principal="$(echo "$*" | awk '{print $NF}')"
+        # kadmin.local sale 0 incluso cuando getprinc falla (bug de
+        # usabilidad de kadmin): la única señal fiable es el listado.
+        # addprinc añade el reino por defecto al nombre desnudo.
+        if ! "$KADMIN_LOCAL" -r "$REALM" -q "listprincs" 2>/dev/null | grep -q "^${principal}@${REALM}\$"; then
+            echo "ERROR [lab]: no se pudo crear $principal ($desc) — kadmin no se queja pero la BD no lo tiene" >&2
+            exit 1
+        fi
+        echo "[lab] creado y verificado: $principal"
+    }
+
+    add_principal_checked "usuario estándar AES+RC4" \
+        "addprinc -pw Jdoe!Pass42 -e aes256-cts-hmac-sha1-96:normal,aes128-cts-hmac-sha1-96:normal,arcfour-hmac-md5:normal jdoe"
+    add_principal_checked "cuenta AES-only" \
+        "addprinc -pw Aes!User01 -e aes256-cts-hmac-sha1-96:normal,aes128-cts-hmac-sha1-96:normal aesuser"
+    add_principal_checked "servicio kerberoast AES+RC4" \
+        "addprinc -pw Mssql!Svc01 -e aes256-cts-hmac-sha1-96:normal,arcfour-hmac-md5:normal mssql/srv01.lab.local"
+    add_principal_checked "servicio RC4-only" \
+        "addprinc -pw Legacy!RC4 -e arcfour-hmac-md5:normal legacy"
+    add_principal_checked "sin preauth (AS-REP roast) AES+RC4" \
+        "addprinc -pw NoPre!Auth1 -requires_preauth -e aes256-cts-hmac-sha1-96:normal,arcfour-hmac-md5:normal nopreauth"
+
+    # El atributo de nopreauth es la pieza crítica del AS-REP roasting:
+    # se comprueba que REQUIRES_PRE_AUTH está LIMPIO (kadmin saldría 0
+    # incluso si el modprinc fallara).
+    if "$KADMIN_LOCAL" -r "$REALM" -q "getprinc nopreauth" 2>/dev/null | grep -q "REQUIRES_PRE_AUTH"; then
+        echo "ERROR [lab]: nopreauth sigue exigiendo preauth — el AS-REP roasting no tendrá dato" >&2
+        exit 1
+    fi
+    echo "[lab] principales creados y verificados: jdoe aesuser mssql/srv01.lab.local legacy nopreauth"
 }
 
 start_kdc() {

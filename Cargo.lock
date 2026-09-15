@@ -154,6 +154,7 @@ dependencies = [
  "charon-kcrypto",
  "getrandom",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

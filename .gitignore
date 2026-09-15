@@ -9,6 +9,10 @@
 *.ccache
 *.cc
 
+# Excepción: los keytab FIXTURE de tests (generados con ktutil de MIT,
+# claves de prueba desechables) sí se versionan como material de test.
+!crates/krb5/tests/fixtures/*.keytab
+
 # Resultados de la matriz: el dataset publicado va en dataset/ (sí se versiona);
 # los ejecuciones locales ad-hoc van a /tmp.
 matrix-out/

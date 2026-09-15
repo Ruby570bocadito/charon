@@ -39,7 +39,9 @@ Las herramientas actuales tratan Kerberos como caja negra:
   PA-DATA y flags.
 - **Persistencia de material (M2b)**: escritura/lectura del formato ccache
   FILE v4 de MIT (verificado contra klist/kinit reales) — guarda el TGT y
-  renueva sin recredencializar.
+  renueva sin recredencializar — y **lectura de keytabs** FILE v1/v2 de MIT
+  (verificados contra ktutil/klist/ktadd reales): autentica con la clave
+  exportada del principal, sin contraseña.
 - **Trace (M3)**: cada mensaje decodificado campo a campo, con explicación
   en español y referencia al RFC — texto coloreado o JSON.
 - **Matriz KDC (M4)**: batería de sondas válidas, casi válidas y
@@ -159,6 +161,12 @@ charon renew --user jdoe -r LAB.LOCAL --renew-hours 168  # renovarlo por el cabl
 charon as --user jdoe -r LAB.LOCAL --renewable --ccache jdoe.ccache
 charon renew --ccache jdoe.ccache                        # sin usuario ni contraseña
 
+# Keytabs (formato FILE v1/v2 de MIT, el que escriben ktadd/ktutil):
+# lista entradas (nunca imprime claves) y autentica con la clave del
+# principal — sin contraseña, como hace un servicio real
+charon keytab --file jdoe.keytab
+charon as --user jdoe -r LAB.LOCAL --keytab jdoe.keytab
+
 # S4U2Self: ticket en nombre de otro usuario (para ver el PAC delegado)
 charon s4u2self --user jdoe --impersonate aesuser -r LAB.LOCAL --dc 10.0.0.1
 
@@ -200,9 +208,16 @@ reino `LAB.LOCAL` y usuarios diseñados para cada primitivo:
 
 ```bash
 bash lab/setup-mit-kdc.sh          # compila, configura, arranca y verifica
-bash lab/setup-mit-kdc.sh status
+bash lab/setup-mit-kdc.sh status   # comprueba si el KDC responde
 cargo test -p charon-client --test integration   # batería contra el KDC real
 ```
+
+El setup verifica cada principal tras crearlo (kadmin.local sale 0 incluso
+si `addprinc` falla) y crea jdoe/mssql/nopreauth con RC4 explícito (el
+defecto de MIT 1.21 es solo AES). Nota de OPSEC al exportar material:
+`ktadd` **rota la clave de la cuenta** y actualiza el kvno (usa
+`ktadd -norandkey` desde kadmin.local para exportar sin rotar) — y un
+keytab lleva claves en claro: 0600 en disco (Charon avisa si no lo está).
 
 Para la matriz contra Windows DC se recomienda el lab GOAD ya disponible
 en el entorno del autor; el runner de la matriz (`charon matrix`) es
@@ -215,7 +230,7 @@ charon/
 ├── crates/                  # workspace Rust — un crate por módulo
 │   ├── asn1/                # codec DER propio (ADR-001) + cross-check openssl
 │   ├── kcrypto/             # crypto RFC: n-fold, DK, CTS, RC4-HMAC, AES (ADR-003)
-│   ├── krb5/                # mensajes AS/TGS/AP/KRB-ERROR + PAC (MS-PAC) + ccache FILE v4
+│   ├── krb5/                # mensajes AS/TGS/AP/KRB-ERROR + PAC (MS-PAC) + ccache FILE v4 + keytab FILE v1/v2
 │   ├── client/              # transporte UDP/TCP:88, sesión KDC, S4U2Self/S4U2Proxy, renovación TGT, ccache
 │   ├── attacks/             # enum, kerberoast, asreproast, pass-the-key, spray + hashcat
 │   ├── trace/               # decodificación campo a campo (texto/JSON)
