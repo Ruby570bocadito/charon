@@ -425,3 +425,110 @@ fn other_desc(p: &AsProbe) -> String {
         AsProbe::Error { code, .. } => format!("Error({code})"),
     }
 }
+
+// ---------- segundo KDC: módulo test KDB (lab/setup-test-kdb.sh) ----------
+
+const DELEG_PORT: u16 = 1190;
+const DELEG_REALM: &str = "DELEG.LAB";
+
+/// Keytabs exportados por el setup (`ktadd -norandkey`) en el estado
+/// desechable del lab, fuera del repo. La env var permite apuntar a otra
+/// instalación; por defecto, la ubicación que escribe el script.
+fn deleg_keytab(name: &str) -> Option<std::path::PathBuf> {
+    let dir =
+        std::env::var_os("CHARON_DELEG_KEYTABS").map_or_else(dirs_home, std::path::PathBuf::from);
+    let p = dir.join(name);
+    if p.is_file() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+fn dirs_home() -> std::path::PathBuf {
+    // El lab vive en $HOME/charon-lab (lab/setup-test-kdb.sh).
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join("charon-lab/deleg/keytabs")
+}
+
+fn deleg_kdc_available() -> bool {
+    // Misma sonda que kdc_available(): un AS-REQ real a un usuario
+    // inexistente del realm DELEG; cualquier respuesta del KDC sirve.
+    let conn = KdcConnection::new(HOST, DELEG_PORT);
+    match charon_client::probe_as_no_preauth(&conn, "kdc-deleg-sonda", DELEG_REALM, &[18]) {
+        Ok(_) => true,
+        Err(ClientError::Krb5(Krb5Error::BadReply(_))) => true,
+        Err(_) => false,
+    }
+}
+
+/// S4U2Proxy END-TO-END contra el segundo KDC (módulo test KDB de MIT con
+/// tabla `delegation`): TGT de service/1 por keytab → evidence ticket
+/// forwardable de S4U2Self → ticket delegado para user hacia service/2 →
+/// descifrado con la clave del DESTINO (keytab) y PAC del suplantado.
+///
+/// Es la prueba que cierra el ciclo MS-SFU completo del proyecto: política
+/// allowed_to_delegate REAL (db2 no la implementa), claves reales exportadas
+/// por ktadd y el PAC que demuestra la suplantación sin participación del
+/// usuario. Sin el lab deleg (lab/setup-test-kdb.sh) el test se salta.
+#[test]
+fn t16_s4u2proxy_end_to_end_con_test_kdb() {
+    let _guard = lock();
+    if !deleg_kdc_available() {
+        eprintln!("SKIP: KDC test-KDB no disponible (lab/setup-test-kdb.sh, puerto {DELEG_PORT})");
+        return;
+    }
+    let (Some(kt1), Some(kt2)) = (deleg_keytab("service1.keytab"), deleg_keytab("service2.keytab"))
+    else {
+        eprintln!("SKIP: keytabs del realm deleg ausentes (lab/setup-test-kdb.sh)");
+        return;
+    };
+    let key1 = {
+        let entries = charon_krb5::keytab::parse(&std::fs::read(&kt1).expect("keytab de service/1 legible"))
+            .expect("el keytab del lab deleg parsea");
+        let e = entries
+            .iter()
+            .find(|e| e.qualified() == "service/1@DELEG.LAB")
+            .expect("service/1 en el keytab del lab deleg");
+        KerberosKey::from_raw(e.enctype, &e.key).unwrap()
+    };
+    let key2 = {
+        let entries = charon_krb5::keytab::parse(&std::fs::read(&kt2).expect("keytab de service/2 legible"))
+            .expect("el keytab del lab deleg parsea");
+        let e = entries
+            .iter()
+            .find(|e| e.qualified() == "service/2@DELEG.LAB")
+            .expect("service/2 en el keytab del lab deleg");
+        KerberosKey::from_raw(e.enctype, &e.key).unwrap()
+    };
+
+    let dconn = KdcConnection::new(HOST, DELEG_PORT);
+    // 1) TGT del servicio que delega, con la clave del keytab.
+    let tgt = request_tgt(&dconn, "service/1", DELEG_REALM, &key1, &[etype::AES256_CTS_HMAC_SHA1_96], kdc_options::FORWARDABLE)
+        .expect("TGT de service/1 con la clave hash del módulo test");
+    assert_eq!(tgt.cname, "service/1");
+
+    // 2) Evidence ticket: forwardable exige ok_to_auth_as_delegate.
+    let evidence = s4u2self(&dconn, &tgt, "service/1", "user", DELEG_REALM)
+        .expect("S4U2Self contra el KDC test");
+    assert_eq!(evidence.cname, "user", "el evidence ticket es del suplantado");
+    assert!(
+        evidence.flags & charon_krb5::ticket_flags::FORWARDABLE != 0,
+        "el módulo test concede FORWARDABLE con ok_to_auth_as_delegate"
+    );
+
+    // 3) S4U2Proxy AUTORIZADO (la tabla delegation: service/1 → service/2).
+    let final_st = s4u2proxy(&dconn, &tgt, &evidence.ticket, "service/2", "user", DELEG_REALM, &[18, 23])
+        .expect("la delegación debe estar autorizada por la tabla delegation");
+    assert_eq!(final_st.cname, "user", "el ticket delegado es del usuario suplantado");
+    assert_eq!(final_st.ticket.sname.flat(), "service/2");
+
+    // 4) Prueba final: el ticket va cifrado con la clave larga del DESTINO
+    // y su PAC muestra al suplantado — la evidencia de la delegación.
+    let pac = charon_krb5::pac::extract_pac(&final_st.ticket, &key2)
+        .expect("el ticket final se descifra con la clave de service/2");
+    let (_, client) = pac.client_info().expect("el PAC lleva CLIENT INFO");
+    assert_eq!(client, "user", "el PAC del ticket delegado acredita al usuario suplantado");
+}

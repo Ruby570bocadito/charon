@@ -36,12 +36,21 @@ Las herramientas actuales tratan Kerberos como caja negra:
   **AES-first** (sin downgrade → sin evento 4769 con 0x17), AS-REP roasting,
   pass-the-key, S4U2Self, **S4U2Proxy** (MS-SFU §2.2.3, primitivo de RBCD) y
   **renovación de TGT** (RFC 4120 §3.3.3), con control total de etypes,
-  PA-DATA y flags.
+  PA-DATA y flags. Los comandos S4U autentican el servicio **con keytab**
+  (sin contraseña) y el ciclo S4U2Proxy está verificado **end-to-end** contra
+  un KDC con política de delegación real (módulo test KDB de MIT): evidence
+  ticket forwardable → ticket delegado → PAC del suplantado descifrado con
+  la clave del destino.
 - **Persistencia de material (M2b)**: escritura/lectura del formato ccache
   FILE v4 de MIT (verificado contra klist/kinit reales) — guarda el TGT y
   renueva sin recredencializar — y **lectura de keytabs** FILE v1/v2 de MIT
   (verificados contra ktutil/klist/ktadd reales): autentica con la clave
-  exportada del principal, sin contraseña.
+  exportada del principal, sin contraseña — en `as`, `s4u2self`, `s4u2proxy`
+  (con `--to-keytab` para el servicio destino).
+- **Salida JSON uniforme**: `as`, `renew`, `passthekey`, `s4u2self` y
+  `s4u2proxy` (además de enum/kerberoast/asreproast/spray/decode/keytab)
+  emiten un objeto JSON por comando con los mismos campos normalizados
+  (identidad, etypes, flags con nombre, tiempos, fuente de clave, PAC).
 - **Trace (M3)**: cada mensaje decodificado campo a campo, con explicación
   en español y referencia al RFC — texto coloreado o JSON.
 - **Matriz KDC (M4)**: batería de sondas válidas, casi válidas y
@@ -167,15 +176,27 @@ charon renew --ccache jdoe.ccache                        # sin usuario ni contra
 charon keytab --file jdoe.keytab
 charon as --user jdoe -r LAB.LOCAL --keytab jdoe.keytab
 
-# S4U2Self: ticket en nombre de otro usuario (para ver el PAC delegado)
+# S4U2Self: ticket en nombre de otro usuario — con contraseña o con
+# --keytab (la clave del servicio sale del fichero; el PAC del suplantado
+# se descifra con la entrada del keytab que corresponda al etype del ticket)
 charon s4u2self --user jdoe --impersonate aesuser -r LAB.LOCAL --dc 10.0.0.1
+charon s4u2self --user service/1 --keytab service1.keytab --impersonate user -r DELEG.LAB
 
 # S4U2Proxy (primitivo de RBCD): evidence ticket de S4U2Self + additional-tickets
-# y opción C_NAME_IN_ADDL_TKT. El servicio delegador necesita
-# ok_to_auth_as_delegate (scripts/lab_setup_delegation.sh). Contra el KDC MIT con
-# backend db2 la petición es correcta pero la política del KDB la deniega
-# (solo los KDB LDAP/test autorizan delegación) — el CLI lo diagnostica
+# y opción C_NAME_IN_ADDL_TKT. Contra backend db2 la petición es correcta pero
+# la política del KDB la deniega (solo KDB LDAP/test autorizan delegación) —
+# el CLI lo diagnostica. Contra un KDB con política (módulo test del lab):
+# --to-keytab descifra el ticket final con la clave del DESTINO y muestra
+# el PAC del suplantado — la prueba de la delegación end-to-end
 charon s4u2proxy --user svc-api --impersonate jdoe --to svc-db -r LAB.LOCAL
+charon s4u2proxy --user service/1 --keytab service1.keytab --impersonate user \
+    --to service/2 --to-keytab service2.keytab -r DELEG.LAB --port 1190
+
+# Salida JSON uniforme en los comandos de sesión (un objeto por comando:
+# crealm/cname/sname, session_etype, flags con nombre, authtime/endtime/
+# renew_till, key_source; en S4U, pac_client/pac_error)
+charon as --user jdoe --keytab jdoe.keytab -r LAB.LOCAL --json
+charon s4u2proxy ... --json | jq '.pac_client'
 
 # Trace de cualquier mensaje capturado (DER crudo)
 charon decode --file as-rep.bin -r LAB.LOCAL --user jdoe
@@ -223,6 +244,33 @@ Para la matriz contra Windows DC se recomienda el lab GOAD ya disponible
 en el entorno del autor; el runner de la matriz (`charon matrix`) es
 agnóstico de la implementación.
 
+### Segundo KDC: delegación REAL con el módulo test KDB de MIT
+
+El backend `db2` del primer KDC **no puede autorizar delegación** — la
+política `allowed_to_delegate` vive en el KDB. `lab/setup-test-kdb.sh` monta
+un **segundo realm** (`DELEG.LAB`, puerto 1190) servido por el módulo test
+KDB de MIT (el mismo que usa la suite de tests de MIT para S4U), que sí
+implementa la tabla `delegation` y sirve claves deterministas (hash del
+nombre+kvno+etype, documentado en `kdb_test.c`):
+
+```bash
+bash lab/setup-test-kdb.sh          # configura, exporta keytabs y arranca
+bash lab/setup-test-kdb.sh status   # comprueba el pidfile
+bash lab/setup-test-kdb.sh stop     # para SOLO este KDC (pidfile)
+
+cargo test -p charon-client --test integration t16_   # end-to-end MS-SFU
+```
+
+Los principals viven en texto plano del `kdc.conf` (el módulo no usa BD);
+las claves se extraen con `ktadd -norandkey` a keytabs 0600 en
+`$HOME/charon-lab/deleg/keytabs/` (fuera del repo) y `kinit -k` con ellas
+es el smoke test del setup. Con eso, `charon s4u2proxy --keytab ... --to-keytab`
+completa el ciclo MS-SFU completo contra un KDC MIT real — véase el test
+t16 (`crates/client/tests/integration.rs`). Nota del módulo: no acepta
+contraseñas (las claves son hash internos) y sus flags van en hexadecimal
+en el kdc.conf — `krb5_flagspec_to_mask` solo parsea UN flag por cadena y
+el módulo aborta con dos (quirk documentado en el script).
+
 ## Estructura del proyecto
 
 ```text
@@ -236,8 +284,8 @@ charon/
 │   ├── trace/               # decodificación campo a campo (texto/JSON)
 │   ├── matrix/              # runner de la matriz KDC → dataset JSON
 │   └── charon/              # el binario CLI
-├── lab/                     # KDC MIT krb5 real sin root (setup + usuarios)
-├── scripts/                 # setup de delegación del lab, captura del README
+├── lab/                     # KDC MIT krb5 real sin root: setup-mit-kdc.sh (LAB.LOCAL) + setup-test-kdb.sh (DELEG.LAB, delegación)
+├── scripts/                 # setup de delegación db2 del lab, captura del README
 ├── dataset/                 # resultados reales de la matriz (publicables)
 ├── docs/
 │   ├── adr/                 # ADR-001 codec propio, ADR-002 Rust, ADR-003 crypto

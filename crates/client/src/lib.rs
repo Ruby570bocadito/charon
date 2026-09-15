@@ -231,7 +231,7 @@ pub fn build_as_req_raw(
         padata,
         body: KdcReqBody {
             kdc_options,
-            cname: Some(PrincipalName::user(user)),
+            cname: Some(PrincipalName::from_short_name(user)),
             realm: realm.to_string(),
             sname: Some(PrincipalName::krbtgt(realm)),
             from: None,
@@ -323,7 +323,11 @@ pub fn parse_as_reply(reply: &[u8], user: &str, key: &KerberosKey) -> Result<Tgt
         ))));
     }
     let rep = KdcRep::parse(reply)?;
-    if rep.cname.name_string.first().map(|s| s.as_str()) != Some(user) {
+    // La comparación va por flat() (componentes unidas con '/') y no por
+    // la primera componente: un principal de servicio (service/1) llega
+    // del KDC como DOS componentes (["service","1"]) — así lo envía el
+    // propio Charon tras from_short_name(), igual que kinit/MIT.
+    if rep.cname.flat() != user {
         return Err(ClientError::Krb5(Krb5Error::BadReply(format!(
             "el AS-REP es para {:?}, no para {}",
             rep.cname.name_string, user
@@ -402,7 +406,13 @@ fn build_pa_tgs_req(
     let now = KrbTime::now();
     let authenticator = Authenticator {
         crealm: tgt.crealm.clone(),
-        cname: PrincipalName::user(&tgt.cname),
+        // from_short_name y no user(): el cname del TGT llega plano
+        // ("service/1" = componentes unidas con '/') y el authenticator
+        // debe reproducir las COMPONENTES del ticket (["service","1"]),
+        // no una sola con el '/' dentro — con una sola, MIT responde
+        // "Ticket/authenticator don't match" (comparación de cname
+        // componente a componente, kdc_util.c/kdc_process_tgs_req).
+        cname: PrincipalName::from_short_name(&tgt.cname),
         cksum: Some(Checksum { cksumtype: cksum_type, checksum: cksum_data }),
         cusec: 0,
         ctime: now,
@@ -470,7 +480,7 @@ pub fn build_as_req_renewable(
         padata,
         body: KdcReqBody {
             kdc_options: kdc_options::RENEWABLE | kdc_options::FORWARDABLE,
-            cname: Some(PrincipalName::user(user)),
+            cname: Some(PrincipalName::from_short_name(user)),
             realm: realm.to_string(),
             sname: Some(PrincipalName::krbtgt(realm)),
             from: None,
@@ -620,8 +630,10 @@ pub fn s4u2self(
         cname: None,
         realm: realm.to_string(),
         // S4U2Self: el sname es el PROPIO servicio que pide; el usuario
-        // suplantado viaja en el PA-FOR-USER (MS-SFU §2.2.2).
-        sname: Some(PrincipalName::user(service_as)),
+        // suplantado viaja en el PA-FOR-USER (MS-SFU §2.2.2). Con parse()
+        // y no user(): el servicio puede ser multi-componente (host/srv)
+        // y como cname de AS, el KDC canonicaliza por componentes.
+        sname: Some(PrincipalName::from_short_name(service_as)),
         from: None,
         till: KrbTime::now().plus_secs(600),
         rtime: None,

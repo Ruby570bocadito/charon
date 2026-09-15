@@ -78,6 +78,30 @@ impl PrincipalName {
         }
     }
 
+    /// Nombre corto parseado como hacen MIT (`krb5_parse_name`) y el
+    /// resto del ecosistema: si trae `/`, se parte en componentes
+    /// (`nt-srv-inst`); si no, es un `nt-principal` de un componente.
+    ///
+    /// Por qué no basta `user()`: un principal de servicio enviado como
+    /// componente ÚNICA (`["service/1"]`) llega al KDC con el nombre
+    /// sin parsear, y cualquier KDB cuyo material dependa del nombre
+    /// canónico diverge — comprobado contra el módulo test de MIT 1.21:
+    /// `unparse_name` ESCAPA el `/` de la componente única
+    /// (`service\/1`), el hash de clave de kdb_test.c usa esa cadena y
+    /// la preautenticación falla con PREAUTH_FAILED aunque la clave sea
+    /// exactamente la exportada por `ktadd`. Con componentes separados
+    /// el unparse es `service/1` y el hash coincide.
+    pub fn from_short_name(name: &str) -> PrincipalName {
+        if name.contains('/') {
+            PrincipalName {
+                name_type: name_type::NT_SRV_INST,
+                name_string: name.split('/').map(|s| s.to_string()).collect(),
+            }
+        } else {
+            Self::user(name)
+        }
+    }
+
     /// SPN `servicio/host` → `nt-srv-inst` con dos componentes.
     /// Si no hay `/`, se trata como componente única.
     pub fn from_spn(spn: &str) -> PrincipalName {
