@@ -19,7 +19,7 @@ use zeroize::Zeroizing;
     version,
     about = "Workbench de protocolo Kerberos: arma y microscopio",
     long_about = "CHARON implementa el protocolo Kerberos desde el wire format —codec ASN.1/DER propio, crypto RFC-conformante—, ejecuta los primitivos ofensivos estándar con control total sobre cada campo, y decodifica cada mensaje explicándolo con referencia al RFC.\n\nDiseñado para laboratorios propios (pentesting autorizado, análisis defensivo, investigación).",
-    after_help = "Ejemplos:\n  charon enum --users jdoe,svcsql,ghost -r LAB.LOCAL\n  charon kerberoast --spn MSSQLSvc/srv01.lab.local --user jdoe --password '***' -r LAB.LOCAL\n  charon decode --file as-rep.bin --password '***' --user jdoe -r LAB.LOCAL\n\nUso ético: solo contra dominios y KDCs de tu propiedad o con autorización explícita."
+    after_help = "Ejemplos:\n  charon enum --users jdoe,svcsql,ghost -r LAB.LOCAL\n  charon kerberoast --spn MSSQLSvc/srv01.lab.local --user jdoe --password '***' -r LAB.LOCAL\n  charon as --user jdoe -r LAB.LOCAL --renewable --ccache jdoe.ccache\n  charon ccache --file jdoe.ccache\n  charon decode --file as-rep.bin --password '***' --user jdoe -r LAB.LOCAL\n\nUso ético: solo contra dominios y KDCs de tu propiedad o con autorización explícita."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -405,6 +405,19 @@ enum Command {
     /// sensible y el listado es para inspección, no para volcado.
     Keytab {
         /// Ruta del fichero keytab (formato FILE v1/v2 de MIT).
+        #[arg(short, long)]
+        file: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspecciona un ccache FILE v4 de MIT (el que escriben `charon as
+    /// --ccache` y `kinit`): principal por defecto y cada credencial con
+    /// su enctype, kvno del ticket, flags con nombre, tiempos y si sigue
+    /// vigente — sin herramientas externas (equivalente a `klist -c`).
+    /// NUNCA imprime la clave de sesión: el ccache lleva material
+    /// sensible y la inspección es para auditar, no para volcar.
+    Ccache {
+        /// Ruta del fichero ccache (formato FILE v4 de MIT).
         #[arg(short, long)]
         file: String,
         #[arg(long)]
@@ -1375,7 +1388,7 @@ fn run(cli: Cli) -> Result<(), String> {
         }
 
         Command::Keytab { file, json } => {
-            warn_lax_keytab_perms(&file);
+            warn_lax_secret_file_perms(&file, "keytab");
             let bytes = std::fs::read(&file).map_err(|e| format!("no pude leer {file}: {e}"))?;
             let entries = charon_krb5::keytab::parse(&bytes)
                 .map_err(|e| format!("keytab {file}: {e}"))?;
@@ -1423,6 +1436,21 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             Ok(())
         }
+
+        Command::Ccache { file, json } => {
+            warn_lax_secret_file_perms(&file, "ccache");
+            let bytes = std::fs::read(&file).map_err(|e| format!("no pude leer {file}: {e}"))?;
+            let info = ccache_info(&bytes).map_err(|e| format!("ccache {file}: {e}"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&info.to_json(&file)).map_err(|e| e.to_string())?
+                );
+            } else {
+                print_ccache(&info, &file);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1446,6 +1474,212 @@ fn print_enum(user: &str, status: &charon_attacks::UserStatus) {
         PreauthFailed => println!("{} {} existe (preauth fallido)", "✓".green().bold(), user.cyan()),
         Other(code) => println!("{} {} → código {} inesperado (apúntalo: fingerprint del KDC)", "?".yellow(), user, code),
     }
+}
+
+// ---------- inspección de ccache (comando `ccache`) ----------
+
+/// Resumen SENSIBLE-FREE de una credencial del ccache: de la clave solo
+/// se expone el enctype, nunca los bytes (el ccache lleva la clave de
+/// sesión en claro por diseño del formato).
+#[derive(Debug)]
+struct CcacheCredInfo {
+    /// Cliente cualificado (`jdoe@LAB.LOCAL`).
+    client: String,
+    /// Servidor cualificado (`krbtgt/LAB.LOCAL@LAB.LOCAL`).
+    server: String,
+    is_config_entry: bool,
+    /// `krbtgt/...` — TGT del propio reino o cross-realm.
+    is_tgt: bool,
+    session_etype: i32,
+    /// kvno y sname del ticket DER (si parsea; una entrada de
+    /// configuración no lleva un ticket real).
+    ticket_kvno: Option<u32>,
+    ticket_sname: Option<String>,
+    flags: Vec<&'static str>,
+    authtime: u32,
+    starttime: Option<u32>,
+    endtime: u32,
+    renew_till: Option<u32>,
+    is_skey: bool,
+    expired: bool,
+    /// Segundos hasta `endtime` (negativo si caducó).
+    seconds_left: i64,
+}
+
+/// Resumen completo de un ccache parseado (sin material sensible).
+#[derive(Debug)]
+struct CcacheFileInfo {
+    version: u8,
+    default_principal: String,
+    credentials: Vec<CcacheCredInfo>,
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Parsea un ccache v4 y resume su contenido. La validez se calcula contra
+/// el reloj actual (igual que hace `klist` al mostrar las fechas: si el
+/// reloj del analista está torcido, el estado también sale torcido — es
+/// inherente a una herramienta offline).
+fn ccache_info(bytes: &[u8]) -> Result<CcacheFileInfo, String> {
+    let file = charon_krb5::ccache::CcacheFile::parse(bytes).map_err(|e| e.to_string())?;
+    let now = unix_now();
+    let mut credentials = Vec::new();
+    for cred in &file.credentials {
+        // kvno y sname salen del ticket DER. Un ticket que no parsea NO
+        // aborta la inspección (reporta el resto; es un workbench, no un
+        // validador estricto — klist hace lo mismo).
+        let (ticket_kvno, ticket_sname) = if cred.is_config_entry() {
+            (None, None)
+        } else {
+            match charon_krb5::ccache::ticket_of(cred) {
+                Ok(t) => (t.enc_part.kvno, Some(t.sname.name_string.join("/"))),
+                Err(_) => (None, None),
+            }
+        };
+        let seconds_left = i64::from(cred.endtime) - now;
+        credentials.push(CcacheCredInfo {
+            client: format!("{}@{}", cred.client.flat(), cred.client.realm),
+            server: format!("{}@{}", cred.server.flat(), cred.server.realm),
+            is_config_entry: cred.is_config_entry(),
+            is_tgt: cred.server.components.first().is_some_and(|c| c == "krbtgt"),
+            session_etype: cred.key.keytype,
+            ticket_kvno,
+            ticket_sname,
+            flags: ticket_flag_names(cred.flags),
+            authtime: cred.authtime,
+            starttime: cred.starttime,
+            endtime: cred.endtime,
+            renew_till: cred.renew_till,
+            is_skey: cred.is_skey,
+            expired: seconds_left <= 0,
+            seconds_left,
+        });
+    }
+    Ok(CcacheFileInfo {
+        version: file.version,
+        default_principal: format!(
+            "{}@{}",
+            file.default_principal.flat(),
+            file.default_principal.realm
+        ),
+        credentials,
+    })
+}
+
+impl CcacheFileInfo {
+    /// Contrato JSON (Ronda V): un objeto por comando, snake_case, sin
+    /// ANSI, tiempos Kerberos y estados explícitos para consumir con jq.
+    /// Las entradas de configuración de MIT no llevan tiempos ni ticket
+    /// reales (campos a 0): se exponen como null, no como fechas falsas.
+    fn to_json(&self, path: &str) -> serde_json::Value {
+        let iso = |secs: u32| charon_asn1::KrbTime::from_unix(i64::from(secs)).to_string();
+        serde_json::json!({
+            "file": path,
+            "format_version": self.version,
+            "default_principal": self.default_principal,
+            "credentials": self.credentials.iter().map(|c| {
+                let real = !c.is_config_entry;
+                serde_json::json!({
+                    "client": c.client,
+                    "server": c.server,
+                    "is_tgt": c.is_tgt,
+                    "is_config_entry": c.is_config_entry,
+                    "session_etype": real.then_some(c.session_etype),
+                    "session_etype_name": real.then(|| etype_name(c.session_etype)),
+                    "ticket_kvno": if real { c.ticket_kvno } else { None::<u32> },
+                    "ticket_sname": if real { c.ticket_sname.clone() } else { None::<String> },
+                    "flags": c.flags,
+                    "is_skey": c.is_skey,
+                    "authtime": real.then(|| iso(c.authtime)),
+                    "starttime": c.starttime.filter(|_| real).map(iso),
+                    "endtime": real.then(|| iso(c.endtime)),
+                    "renew_till": c.renew_till.filter(|_| real).map(iso),
+                    "expired": if real { c.expired } else { false },
+                    "seconds_left": real.then_some(c.seconds_left),
+                })
+            }).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Salida humana: una línea de cabecera, un bloque por credencial y el
+/// estado de vigencia — el mismo papel que `klist -c` para un ccache
+/// escrito por `kinit`/Charon, en el idioma y el estilo del workbench.
+fn print_ccache(info: &CcacheFileInfo, file: &str) {
+    println!(
+        "{} {} (formato FILE v{} de MIT, {} credencial(es))",
+        "ccache:".bold(),
+        file.cyan(),
+        info.version,
+        info.credentials.len()
+    );
+    println!(
+        "  principal por defecto: {}",
+        info.default_principal.green()
+    );
+    for (i, c) in info.credentials.iter().enumerate() {
+        let idx_raw = format!("[{i}]");
+        let idx = idx_raw.dimmed();
+        if c.is_config_entry {
+            println!(
+                "  {idx} entrada de configuración de MIT: {} (no es un ticket)",
+                c.server.dimmed()
+            );
+            continue;
+        }
+        let kind = if c.is_tgt { "TGT" } else { "ticket de servicio" };
+        println!(
+            "  {idx} {} de {} → {} ({})",
+            kind,
+            c.client.cyan(),
+            c.server.yellow(),
+            etype_name(c.session_etype)
+        );
+        if let (Some(k), Some(s)) = (c.ticket_kvno, &c.ticket_sname) {
+            println!("        ticket: sname {s}, kvno {k}");
+        }
+        let mut bits: Vec<&str> = c.flags.clone();
+        if c.is_skey {
+            bits.push("skey");
+        }
+        if !bits.is_empty() {
+            println!("        flags: {}", bits.join(", "));
+        }
+        let et = charon_asn1::KrbTime::from_unix(i64::from(c.endtime)).to_string();
+        let at = charon_asn1::KrbTime::from_unix(i64::from(c.authtime)).to_string();
+        let rt = c
+            .renew_till
+            .map(|t| format!("  renew_till {}", charon_asn1::KrbTime::from_unix(i64::from(t))))
+            .unwrap_or_default();
+        println!("        authtime {at}  endtime {et}{rt}");
+        let estado = if c.expired {
+            format!(
+                "CADUCADA hace {} min",
+                (-c.seconds_left / 60).max(1)
+            )
+            .red()
+            .bold()
+            .to_string()
+        } else {
+            format!(
+                "válida {} h {} min más",
+                c.seconds_left / 3600,
+                (c.seconds_left % 3600) / 60
+            )
+            .green()
+            .to_string()
+        };
+        println!("        estado: {estado}");
+    }
+    println!(
+        "\n{}",
+        "(la clave de sesión no se imprime: el ccache lleva material sensible)".dimmed()
+    );
 }
 
 /// "@fichero" carga una lista; si no, toma los valores tal cual.
@@ -1751,17 +1985,18 @@ fn key_from_credentials(
     KerberosKey::from_password(password, _salt, etype_mod::AES256_CTS_HMAC_SHA1_96).map_err(|e| e.to_string())
 }
 
-/// Aviso si el keytab es legible por grupo/otros: el fichero lleva las
-/// claves largas EN CLARO (diseño del formato); MIT lo crea 0600 y así
-/// debe quedarse. Es un aviso a stderr, no un error: leerlo es legítimo.
+/// Aviso si un fichero de material sensible (keytab, ccache) es legible
+/// por grupo/otros: ambos formatos llevan claves EN CLARO (diseño del
+/// formato); MIT los crea 0600 y así deben quedarse. Es un aviso a
+/// stderr, no un error: leerlos es legítimo.
 #[cfg(unix)]
-fn warn_lax_keytab_perms(path: &str) {
+fn warn_lax_secret_file_perms(path: &str, what: &str) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(md) = std::fs::metadata(path) {
         let mode = md.permissions().mode();
         if mode & 0o077 != 0 {
             eprintln!(
-                "{} el keytab {path} es legible por grupo/otros (permisos {:04o}): \
+                "{} el {what} {path} es legible por grupo/otros (permisos {:04o}): \
                  contiene claves en claro — recomendado 0600",
                 "aviso:".yellow().bold(),
                 mode & 0o777
@@ -1771,7 +2006,7 @@ fn warn_lax_keytab_perms(path: &str) {
 }
 
 #[cfg(not(unix))]
-fn warn_lax_keytab_perms(_path: &str) {}
+fn warn_lax_secret_file_perms(_path: &str, _what: &str) {}
 
 /// Clave a partir de un keytab: la entrada cuyo principal coincide con
 /// `user@realm` (por nombre cualificado o por nombre plano + reino).
@@ -1780,7 +2015,7 @@ fn warn_lax_keytab_perms(_path: &str) {}
 /// reinos distintos. Devuelve la clave junto a su kvno y enctype para
 /// el mensaje del CLI.
 fn key_from_keytab(path: &str, user: &str, realm: &str) -> Result<(KerberosKey, u32, i32), String> {
-    warn_lax_keytab_perms(path);
+    warn_lax_secret_file_perms(path, "keytab");
     let bytes = std::fs::read(path).map_err(|e| format!("no pude leer {path}: {e}"))?;
     let entries =
         charon_krb5::keytab::parse(&bytes).map_err(|e| format!("keytab {path}: {e}"))?;
@@ -1805,7 +2040,7 @@ fn key_from_keytab(path: &str, user: &str, realm: &str) -> Result<(KerberosKey, 
 /// Los comandos S4U lo necesitan para elegir la clave de descifrado del
 /// ticket según el etype REAL que el KDC eligió (ver s4u2self).
 fn keys_from_keytab(path: &str, user: &str, realm: &str) -> Result<Vec<(KerberosKey, u32, i32)>, String> {
-    warn_lax_keytab_perms(path);
+    warn_lax_secret_file_perms(path, "keytab");
     let bytes = std::fs::read(path).map_err(|e| format!("no pude leer {path}: {e}"))?;
     let entries =
         charon_krb5::keytab::parse(&bytes).map_err(|e| format!("keytab {path}: {e}"))?;
@@ -1926,5 +2161,124 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&path2).ok();
+    }
+
+    // ---------- tests de `charon ccache` ----------
+
+    use charon_krb5::ccache::{CcacheCredential, CcacheFile, CcachePrincipal};
+    use charon_krb5::{EncryptedData, EncryptionKey, PrincipalName, Ticket};
+
+    /// Ccache sintético construido con el propio codec (mismo camino que
+    /// `save_tgt`): un TGT de jdoe con endtime = ahora + `offset_secs`
+    /// (acepta negativos para simular credenciales caducadas).
+    fn ccache_de_ejemplo(offset_secs: i64) -> Vec<u8> {
+        let now = unix_now() as u32;
+        let endtime = (i64::from(now) + offset_secs) as u32;
+        let ticket = Ticket {
+            tkt_vno: 5,
+            realm: "LAB.LOCAL".into(),
+            sname: PrincipalName::krbtgt("LAB.LOCAL"),
+            enc_part: EncryptedData {
+                etype: 18,
+                kvno: Some(2),
+                cipher: vec![0xde, 0xad, 0xbe, 0xef],
+            },
+        };
+        let cred = CcacheCredential {
+            client: CcachePrincipal::user("jdoe", "LAB.LOCAL"),
+            server: CcachePrincipal::from_principal(&PrincipalName::krbtgt("LAB.LOCAL"), "LAB.LOCAL"),
+            key: EncryptionKey { keytype: 18, keyvalue: vec![0x11; 32] },
+            authtime: now - 600,
+            starttime: Some(now - 600),
+            endtime,
+            renew_till: Some(endtime + 604_800),
+            is_skey: false,
+            flags: charon_krb5::ticket_flags::FORWARDABLE | charon_krb5::ticket_flags::RENEWABLE,
+            ticket_der: ticket.build().expect("ticket DER"),
+        };
+        CcacheFile::single(cred).to_bytes().expect("ccache bytes")
+    }
+
+    #[test]
+    fn ccache_info_reporta_tgt_completo_y_vigente() {
+        let info = ccache_info(&ccache_de_ejemplo(7200)).expect("parsea");
+        assert_eq!(info.version, 4);
+        assert_eq!(info.default_principal, "jdoe@LAB.LOCAL");
+        assert_eq!(info.credentials.len(), 1);
+        let c = &info.credentials[0];
+        assert!(c.is_tgt, "krbtgt/... debe marcarse como TGT");
+        assert!(!c.is_config_entry);
+        assert!(!c.expired, "endtime a +2 h no puede salir caducada");
+        assert_eq!(c.client, "jdoe@LAB.LOCAL");
+        assert_eq!(c.server, "krbtgt/LAB.LOCAL@LAB.LOCAL");
+        assert_eq!(c.session_etype, 18);
+        assert_eq!(c.ticket_kvno, Some(2));
+        assert_eq!(c.ticket_sname.as_deref(), Some("krbtgt/LAB.LOCAL"));
+        assert!(c.flags.contains(&"forwardable") && c.flags.contains(&"renewable"));
+        assert!((7000..=7200).contains(&c.seconds_left), "quedan {:?}", c.seconds_left);
+        // El JSON hereda el contrato de la Ronda V: snake_case, sin ANSI,
+        // tiempos Kerberos (GeneralizedTime, sufijo Z).
+        let j = info.to_json("t.ccache");
+        assert_eq!(j["format_version"], 4);
+        assert_eq!(j["credentials"][0]["is_tgt"], true);
+        assert_eq!(j["credentials"][0]["session_etype_name"], "AES256-CTS-HMAC-SHA1-96");
+        let end = j["credentials"][0]["endtime"].as_str().unwrap();
+        assert!(end.ends_with('Z') && end.len() >= 15, "endtime Kerberos: {end}");
+    }
+
+    #[test]
+    fn ccache_info_marca_caducada() {
+        let info = ccache_info(&ccache_de_ejemplo(-3600)).expect("parsea");
+        let c = &info.credentials[0];
+        assert!(c.expired);
+        assert!(c.seconds_left <= -3599, "un reloj en el pasado sale negativo: {:?}", c.seconds_left);
+    }
+
+    #[test]
+    fn ccache_info_rechaza_bytes_corruptos_sin_panics() {
+        assert!(ccache_info(&[]).is_err());
+        assert!(ccache_info(&[0x05, 0x02]).is_err());
+        let bytes = ccache_de_ejemplo(600);
+        for cut in [2usize, 12, 40, bytes.len() - 3] {
+            assert!(ccache_info(&bytes[..cut]).is_err(), "truncado a {cut} debe fallar");
+        }
+    }
+
+    #[test]
+    fn ccache_info_marca_entrada_de_configuracion_sin_ticket() {
+        use charon_krb5::ccache::X_CACHECONF_REALM;
+        let mut cred = CcacheCredential {
+            client: CcachePrincipal::user("jdoe", "LAB.LOCAL"),
+            server: CcachePrincipal::user("krb5_ccache_conf_data", "X-CACHECONF:"),
+            key: EncryptionKey { keytype: 0, keyvalue: vec![] },
+            authtime: 0,
+            starttime: None,
+            endtime: 0,
+            renew_till: None,
+            is_skey: false,
+            flags: 0,
+            ticket_der: vec![1, 2, 3],
+        };
+        cred.server = CcachePrincipal {
+            name_type: charon_krb5::name_type::NT_PRINCIPAL,
+            realm: X_CACHECONF_REALM.into(),
+            components: vec!["krb5_ccache_conf_data".into(), "pa_type".into()],
+        };
+        let bytes = CcacheFile::single(cred).to_bytes().expect("bytes");
+        let info = ccache_info(&bytes).expect("parsea");
+        let c = &info.credentials[0];
+        assert!(c.is_config_entry);
+        assert!(!c.is_tgt);
+        assert_eq!(c.ticket_kvno, None, "una entrada de config no lleva ticket");
+        // El JSON de una entrada de configuración no inventa datos:
+        // etype/tiempos/kvno a null (campos a 0 del formato).
+        let j = info.to_json("t.ccache");
+        let jc = &j["credentials"][0];
+        assert_eq!(jc["is_config_entry"], true);
+        assert!(jc["session_etype"].is_null());
+        assert!(jc["authtime"].is_null());
+        assert!(jc["endtime"].is_null());
+        assert!(jc["ticket_kvno"].is_null());
+        assert_eq!(jc["expired"], false);
     }
 }

@@ -45,6 +45,7 @@ SECTIONS = [
      "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022 "
      "-r LAB.LOCAL --port 1088", "demo-kerb.txt", True),
     ("charon asreproast --users nopreauth -r LAB.LOCAL --port 1088", "demo-asrep.txt", True),
+    ("charon ccache --file jdoe.ccache", "demo-ccache.txt", False),
 ]
 
 CMD_COLS = 94  # ancho máximo de línea de comando antes de partir

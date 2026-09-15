@@ -50,12 +50,17 @@ Las herramientas actuales tratan Kerberos como caja negra:
   vía de política del KDC.
 - **Persistencia de material (M2b)**: escritura/lectura del formato ccache
   FILE v4 de MIT (verificado contra klist/kinit reales) — guarda el TGT y
-  renueva sin recredencializar — y **lectura de keytabs** FILE v1/v2 de MIT
-  (verificados contra ktutil/klist/ktadd reales): autentica con la clave
-  exportada del principal, sin contraseña — en `as`, `s4u2self`, `s4u2proxy`
-  (con `--to-keytab` para el servicio destino).
-- **Salida JSON uniforme**: `as`, `renew`, `passthekey`, `s4u2self` y
-  `s4u2proxy` (además de enum/kerberoast/asreproast/spray/decode/keytab)
+  renueva sin recredencializar — y **inspección nativa del ccache**
+  (`charon ccache`: principal por defecto, cada credencial con enctype,
+  kvno del ticket, flags con nombre, tiempos y vigencia — sin recurrir a
+  `klist`, interoperable con ficheros escritos por `kinit` real) — y
+  **lectura de keytabs** FILE v1/v2 de MIT (verificados contra
+  ktutil/klist/ktadd reales): autentica con la clave exportada del
+  principal, sin contraseña — en `as`, `s4u2self`, `s4u2proxy` (con
+  `--to-keytab` para el servicio destino).
+- **Salida JSON uniforme**: `as`, `renew`, `passthekey`, `s4u2self`,
+  `s4u2proxy` y `ccache` (además de
+  enum/kerberoast/asreproast/spray/decode/keytab)
   emiten un objeto JSON por comando con los mismos campos normalizados
   (identidad, etypes, flags con nombre, tiempos, fuente de clave, PAC).
   **Enum y spray** emiten arrays con estados snake_case estables
@@ -69,11 +74,18 @@ Las herramientas actuales tratan Kerberos como caja negra:
 
 ## Demonstración (salidas reales contra MIT krb5 1.21.3)
 
-![Demonstración de charon: enum, kerberoast y asreproast contra un KDC MIT real](docs/assets/charon-demo.png)
+![Demonstración de charon: enum, kerberoast, asreproast y ccache contra un KDC MIT real](docs/assets/charon-demo.png)
 
-*Captura generada con [`scripts/make_screenshot.py`](scripts/make_screenshot.py) a partir
-de ejecuciones reales; los hashes aparecen recortados (los completos están en
-[`traces/`](traces/) y en el [dataset](dataset/)).*
+**Demo animada** — el ciclo completo de una sesión de laboratorio: enumeración,
+kerberoasting, petición de TGT renovable con persistencia en ccache, inspección
+del ccache y delegación RBCD end-to-end (todo real, contra los dos KDCs del lab):
+
+![Demo animada de charon: enum, kerberoast, ccache y RBCD contra MIT krb5 real](docs/assets/charon-demo.gif)
+
+*Ambas capturas se generan con [`scripts/make_screenshot.py`](scripts/make_screenshot.py)
+y [`scripts/make_gif.py`](scripts/make_gif.py) a partir de ejecuciones reales;
+los hashes aparecen recortados (los completos están en [`traces/`](traces/) y en
+el [dataset](dataset/)).*
 
 **Enumeración de usuarios por códigos de error del KDC** (6 = no existe,
 25 = existe con preauth + salt regalado, sin preauth = AS-REP roasteable):
@@ -180,6 +192,12 @@ charon renew --user jdoe -r LAB.LOCAL --renew-hours 168  # renovarlo por el cabl
 # el fichero se escribe 0600 y lo leen klist/kinit reales
 charon as --user jdoe -r LAB.LOCAL --renewable --ccache jdoe.ccache
 charon renew --ccache jdoe.ccache                        # sin usuario ni contraseña
+
+# Inspección del ccache (equivalente a klist -c, sin herramientas externas):
+# credenciales con enctype, kvno del ticket, flags y vigencia — con --json
+# para consumir con jq. Lee ficheros escritos por charon Y por kinit real
+charon ccache --file jdoe.ccache
+charon ccache --file jdoe.ccache --json | jq '.credentials[] | select(.is_tgt)'
 
 # Keytabs (formato FILE v1/v2 de MIT, el que escriben ktadd/ktutil):
 # lista entradas (nunca imprime claves) y autentica con la clave del
@@ -321,7 +339,7 @@ charon/
 │   ├── matrix/              # runner de la matriz KDC → dataset JSON
 │   └── charon/              # el binario CLI
 ├── lab/                     # KDC MIT krb5 real sin root: setup-mit-kdc.sh (LAB.LOCAL) + setup-test-kdb.sh (DELEG.LAB, delegación)
-├── scripts/                 # setup de delegación db2 del lab, captura del README
+├── scripts/                 # setup de delegación db2 del lab, captura del README (PNG + GIF animado)
 ├── dataset/                 # resultados reales de la matriz (publicables)
 ├── docs/
 │   ├── adr/                 # ADR-001 codec propio, ADR-002 Rust, ADR-003 crypto
