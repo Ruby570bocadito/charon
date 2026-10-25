@@ -393,6 +393,14 @@ pentesting autorizado y análisis defensivo**. La herramienta no omite ningún
 paso: cada primitivo documenta qué escribe en el cable y qué deja en los
 logs del KDC (ver `docs/threat-model.md`).
 
+## Roadmap
+
+El plan de ampliación del proyecto —horizontes de protocolo, nuevos
+primitivos, el ángulo defensivo, la matriz como investigación publicable,
+calidad, distribución y los saltos grandes (PKINIT/ADCS, cross-realm)— vive en
+[`docs/ROADMAP.md`](docs/ROADMAP.md), con tabla de priorización y métricas de
+éxito.
+
 ## Licencia
 
 MIT — ver [LICENSE](LICENSE).
