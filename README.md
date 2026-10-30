@@ -1,20 +1,76 @@
 # CHARON — workbench del protocolo Kerberos
 
 [![CI](https://github.com/Ruby570bocadito/charon/actions/workflows/ci.yml/badge.svg)](https://github.com/Ruby570bocadito/charon/actions/workflows/ci.yml)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://rustup.rs)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 > *"Charon es el barquero que transporta almas entre mundos. Una herramienta
 > que transporta mensajes entre cliente y KDC, y te muestra todo lo que
 > cruza el río."*
 
-**CHARON implementa el protocolo Kerberos desde el wire format** —codec
-ASN.1/DER propio, crypto RFC-conformante—, ejecuta los primitivos ofensivos
-estándar con control total sobre cada campo, decodifica cada mensaje
-explicándolo campo por campo con referencia al RFC, y compara cómo responden
-distintas implementaciones de KDC.
+**CHARON es un stack de Kerberos escrito desde cero en Rust** —sin librerías
+krb5: codec ASN.1/DER propio, crypto RFC-conformante, mensajes construidos
+byte a byte— que lanza los ataques estándar de Active Directory **y a la vez
+te enseña exactamente qué viaja por el cable**.
 
-Es **arma y microscopio** a la vez: responde la pregunta que separa a un
-usuario de herramientas de alguien que entiende el protocolo — *"¿qué viaja
-exactamente por el cable, por qué, y qué pasa si cambio este campo?"*.
+Es **arma y microscopio**. Responde la pregunta que separa al que *usa*
+herramientas del que *entiende* el protocolo: *"¿qué viaja exactamente por el
+cable, por qué, y qué pasa si cambio este campo?"*.
+
+### Qué lo hace distinto
+
+Hay muchas herramientas de Kerberos. CHARON apuesta por tres cosas que las demás no dan juntas:
+
+1. **🔬 Microscopio, no caja negra** — cada mensaje se decodifica *campo a
+   campo*, con la cita exacta del RFC y una explicación en español. No ejecutas
+   un ataque: ves el protocolo mientras pasa.
+2. **🥷 Kerberoasting AES-first** — pide `[AES256, AES128]` y solo cae a RC4 si
+   no hay más remedio. Las herramientas clásicas piden RC4 siempre, lo que
+   dispara un evento 4769 con `0x17` (downgrade detectable). CHARON elimina esa
+   huella.
+3. **⚙️ Control total de cada campo** — etypes, PA-DATA, flags y nonces son
+   tuyos. Puedes mandar un mensaje válido, uno torcido a propósito, o el bit
+   RBCD de MS-KILE byte a byte igual que el cliente de referencia de MIT.
+
+Todo verificado **end-to-end contra un KDC MIT krb5 1.21.3 real** (no mocks).
+
+### Arquitectura en 10 segundos
+
+Léelo de abajo arriba: cada capa se apoya en la de debajo, y lo único que ve
+el usuario es el binario de arriba. Todo lo demás lo construiste tú desde el
+wire format.
+
+```text
+┌────────────────────────────────────────────────┐
+│  charon · binario CLI (13 subcomandos)           │  ← la única cara visible
+└────────────────────────────────────────────────┘
+        │  attacks · trace · matrix                    ← uso: ataques · microscopio · research
+        ▼
+┌────────────────────────────────────────────────┐
+│  client   · driver KDC (UDP/TCP 88)              │ ┐
+│  krb5     · mensajes AS/TGS · PAC · ccache       │ │ pila de protocolo PROPIA,
+│  kcrypto  · cripto Kerberos (AES, RC4-HMAC, RFC) │ │ desde el cable, sin libs krb5
+│  asn1     · codec DER propio                     │ ┘
+└────────────────────────────────────────────────┘
+```
+
+Recorrido detallado de cada crate en [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md).
+
+### Empieza en 3 pasos
+
+```bash
+# 1. Compila (necesitas Rust 1.85+)
+cargo build --release
+
+# 2. Monta un KDC MIT real en local (sin root, se compila y arranca solo)
+bash lab/setup-mit-kdc.sh
+
+# 3. Lanza tu primer ataque contra el lab y mira qué existe
+./target/release/charon enum --users jdoe,aesuser,legacy,nopreauth,ghost -r LAB.LOCAL
+```
+
+¿Prefieres ver qué viaja por el cable? Añade un trace a cualquier comando de
+sesión, o empieza por la [demo de abajo](#demostración-salidas-reales-contra-mit-krb5-1213).
 
 ## Por qué existe
 
@@ -26,13 +82,13 @@ Las herramientas actuales tratan Kerberos como caja negra:
 | Impacket (Python) | Primitivos concretos | Requiere Python; mensajes y flujo pre-cocinados |
 | Wireshark | Decodifica capturas | Solo observa; no construye ni modifica mensajes |
 
-## Características principales
+## Qué hace, en detalle
 
-- **Stack de protocolo propio (M1)**: codec DER mínimo (ADR-001), crypto
+- **Stack de protocolo propio**: codec DER mínimo (ADR-001), crypto
   Kerberos RFC-conformante (RC4-HMAC RFC 4757, AES-CTS-HMAC-SHA1
   RFC 3961/3962) validada con los test vectors de los RFC y contra un KDC
   real, builders/parsers de AS/TGS/AP/KRB-ERROR/PAC.
-- **Primitivos ofensivos (M2)**: enumeración de usuarios, kerberoasting
+- **Primitivos ofensivos**: enumeración de usuarios, kerberoasting
   **AES-first** (sin downgrade → sin evento 4769 con 0x17), AS-REP roasting,
   pass-the-key, S4U2Self, **S4U2Proxy** (MS-SFU §2.2.3, primitivo de RBCD) y
   **renovación de TGT** (RFC 4120 §3.3.3), con control total de etypes,
@@ -48,7 +104,7 @@ Las herramientas actuales tratan Kerberos como caja negra:
   `msDS-AllowedToActOnBehalfOfOtherIdentity`; en el lab: la tabla `rbcd` del
   módulo test). Los tests t17/t18 demuestran por cable que el bit conmuta la
   vía de política del KDC.
-- **Persistencia de material (M2b)**: escritura/lectura del formato ccache
+- **Persistencia de material**: escritura/lectura del formato ccache
   FILE v4 de MIT (verificado contra klist/kinit reales) — guarda el TGT y
   renueva sin recredencializar — y **inspección nativa del ccache**
   (`charon ccache`: principal por defecto, cada credencial con enctype,
@@ -67,14 +123,14 @@ Las herramientas actuales tratan Kerberos como caja negra:
   (`exists_preauth`/`no_preauth`/`unknown`/`valid`/`wrong_password`/
   `kdc_error`/`protocol_error`) y campos dedicados (salts, códigos del KDC)
   — sin acoplarse a la representación interna de los tipos.
-- **Trace (M3)**: cada mensaje decodificado campo a campo, con explicación
+- **Trace**: cada mensaje decodificado campo a campo, con explicación
   en español y referencia al RFC — texto coloreado o JSON.
-- **Matriz KDC (M4)**: batería de sondas válidas, casi válidas y
+- **Matriz KDC**: batería de sondas válidas, casi válidas y
   deliberadamente torcidas; dataset JSON reproducible por implementación.
 
-## Demonstración (salidas reales contra MIT krb5 1.21.3)
+## Demostración (salidas reales contra MIT krb5 1.21.3)
 
-![Demonstración de charon: enum, kerberoast, asreproast y ccache contra un KDC MIT real](docs/assets/charon-demo.png)
+![Demostración de charon: enum, kerberoast, asreproast y ccache contra un KDC MIT real](docs/assets/charon-demo.png)
 
 **Demo animada** — el ciclo completo de una sesión de laboratorio: enumeración,
 kerberoasting, petición de TGT renovable con persistencia en ccache, inspección
